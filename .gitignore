@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+.dart_tool/
+
+# Environment and sensitive keys
+.env
+.env.*
+*.pem
+*.key
+
+# Build outputs
+dist/
+build/
+*.log
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.pdf
+tmp/

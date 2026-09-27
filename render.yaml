@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: hostel-print-backend
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm --prefix telegram-bot install && npm --prefix telegram-bot run build
+    startCommand: node telegram-bot/dist/index.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
