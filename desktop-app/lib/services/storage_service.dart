@@ -27,7 +27,7 @@ class StorageService {
 
   static Future<String> getBackendUrl() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_keyBackendUrl) ?? 'http://localhost:3000';
+    return prefs.getString(_keyBackendUrl) ?? 'https://hostel-print-backend-7w74.onrender.com';
   }
 
   static Future<void> setBackendUrl(String url) async {
