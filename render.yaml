@@ -6,6 +6,7 @@ services:
     region: singapore
     buildCommand: npm --prefix telegram-bot install && npm --prefix telegram-bot run build
     startCommand: node telegram-bot/dist/index.js
+    healthCheckPath: /health
     envVars:
       - key: PORT
         value: 10000
