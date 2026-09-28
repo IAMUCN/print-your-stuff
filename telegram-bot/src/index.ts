@@ -14,7 +14,7 @@ import cors from "@fastify/cors";
 import jwt from "@fastify/jwt";
 import { webhookCallback } from "grammy";
 import { config } from "./config.js";
-import { createBot } from "./bot/index.js";
+import { createBot, registerBotCommands } from "./bot/index.js";
 import { authRoutes } from "./api/routes/auth.routes.js";
 import { jobsRoutes } from "./api/routes/jobs.routes.js";
 import { seed } from "./db/seed.js";
@@ -109,8 +109,10 @@ async function startServer() {
       const targetWebhook = `${config.webhookUrl}/api/v1/telegram/webhook`;
       await bot.api.setWebhook(targetWebhook);
       console.log(`📡 Telegram Webhook set to: ${targetWebhook}`);
+      await registerBotCommands(bot);
     } else if (config.telegramBotToken) {
       console.log("🔄 Starting Telegram bot in local Long-Polling mode...");
+      await registerBotCommands(bot);
       bot.start({
         onStart: (info) => console.log(`🤖 Bot @${info.username} is running and listening!`),
       });

@@ -293,17 +293,12 @@ class PrinterService {
 
       final sw = Stopwatch()..start();
       final isColor = colorMode.toUpperCase() == 'COLOR';
-      final dmColor = isColor ? 2 : 1; // 1=Monochrome, 2=Color
+      final colorFlag = isColor ? '1' : '0';
+      final colorOption = isColor ? 'psk:Color' : 'psk:Grayscale';
+      final sanitizedName = _sanitizeForPs(printerName);
 
-      // 1. Fast Win32 DEVMODE update via native helper executable (<80ms)
-      final helper = _findHelperExe();
-      if (helper != null) {
-        try {
-          await Process.run(helper, ['apply', printerName, effectiveDpi.toString(), dmColor.toString()]);
-        } catch (_) {}
-      }
-
-      // 2. Fast V4 PrintTicket XML update via PowerShell (no compilation needed!)
+      // Fast V4 PrintTicket XML update via Set-PrintConfiguration
+      // (Note: We do NOT call Win32 SetPrinter with DEVMODE, because V4 drivers reset to Factory Defaults when touched by legacy SetPrinter)
       final qualityOption = switch (effectiveQuality.toUpperCase()) {
         'DRAFT' => 'psk:Draft',
         'BEST' => 'psk:High',
@@ -314,14 +309,16 @@ class PrinterService {
         'BEST' => 'ns0000:High',
         _ => 'ns0000:Normal',
       };
+      final shortcutOption = switch (effectiveQuality.toUpperCase()) {
+        'DRAFT' => '_FastEco',
+        'BEST' => '_PhotoPrintingBorderless',
+        _ => '_GeneralEveryday',
+      };
       final dpiOption = switch (effectiveDpi) {
         300 => 'ns0000:_300dpi',
         1200 => 'ns0000:_1200dpi',
         _ => 'ns0000:_600dpi',
       };
-      final colorFlag = isColor ? '1' : '0';
-      final colorOption = isColor ? 'psk:Color' : 'psk:Grayscale';
-      final sanitizedName = _sanitizeForPs(printerName);
 
       final script = '''
 \$name = '$sanitizedName';
@@ -342,6 +339,8 @@ if (\$cfg) {
       };
       if (\$f.name -eq 'psk:PageOutputColor') { \$f.Option.name = '$colorOption' };
     };
+    \$scNode = \$ticket.SelectSingleNode("//*[local-name()='Property'][@name='ns0000:ShortcutName']/*[local-name()='Value']");
+    if (\$scNode) { \$scNode.InnerText = '$shortcutOption' };
     Set-PrintConfiguration -PrinterName \$name -PrintTicketXml \$ticket.OuterXml -Color:$colorFlag -ErrorAction SilentlyContinue;
   } else {
     Set-PrintConfiguration -PrinterName \$name -Color:$colorFlag -ErrorAction SilentlyContinue;

@@ -179,9 +179,24 @@ export function createBot(): Bot<BotContext> {
     );
   });
 
-  // 6. /help command
-  bot.command("help", async (ctx) => {
+  // 6. /help & /commands
+  bot.command(["help", "commands"], async (ctx) => {
     return sendHelpMessage(ctx);
+  });
+
+  // 7. /menu command
+  bot.command("menu", async (ctx) => {
+    ctx.session = {};
+    const user = await getDbUser(ctx);
+    if (!user) {
+      ctx.session.step = "AWAITING_NAME";
+      return ctx.reply(
+        "👋 Welcome to the **Hostel Print Service**!\n\n" +
+          "Before starting, please reply with your **Display Name**:",
+        { parse_mode: "Markdown" }
+      );
+    }
+    return sendMainMenu(ctx, user.displayName);
   });
 
   // Main menu renderer
@@ -190,11 +205,15 @@ export function createBot(): Bot<BotContext> {
       .text("📄 New Print Job", "menu_new_job")
       .row()
       .text("📋 My Jobs", "menu_my_jobs")
-      .text("❓ Help & Formats", "menu_help");
+      .text("❓ Help & Commands", "menu_help")
+      .row()
+      .text("👤 Change Name", "menu_change_name")
+      .text("🧹 Clear Session", "menu_clear");
 
     await ctx.reply(
       `🖨️ *Hostel Print Service*\nWelcome back, *${escapeMarkdown(name)}*!\n\n` +
-        `Submit your PDF or Word documents below to get a print job code.`,
+        `Submit your PDF or Word documents below to get a print job code.\n\n` +
+        `Tap *Menu* (or type /menu) anytime to view available commands.`,
       {
         parse_mode: "Markdown",
         reply_markup: keyboard,
@@ -324,6 +343,39 @@ export function createBot(): Bot<BotContext> {
     const user = await getDbUser(ctx);
     if (!user) return;
     return sendMyJobsMenu(ctx, user.id);
+  });
+
+  bot.callbackQuery("menu_change_name", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    ctx.session.step = "AWAITING_NAME";
+    await ctx.reply(
+      "👤 <b>Change Display Name</b>\n\n" +
+        "Please reply with your new display name (or use <code>/name Your Name</code>):",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.callbackQuery("menu_clear", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const user = await getDbUser(ctx);
+    if (user) {
+      await db
+        .delete(schema.jobs)
+        .where(and(eq(schema.jobs.userId, user.id), eq(schema.jobs.status, "DRAFT")));
+    }
+    ctx.session = {};
+    const timer = ctx.from ? draftSummaryTimers.get(ctx.from.id) : undefined;
+    if (timer) clearTimeout(timer);
+    if (ctx.from) draftSummaryTimers.delete(ctx.from.id);
+
+    await ctx.reply(
+      "🧹 <b>Session and active drafts cleared.</b>\n\n" +
+        "You can start fresh anytime by sending a document or tapping /start.",
+      { parse_mode: "HTML" }
+    );
+    if (user) {
+      await sendMainMenu(ctx, user.displayName);
+    }
   });
 
   // Cancel an active waiting job
@@ -795,4 +847,21 @@ export function createBot(): Bot<BotContext> {
   }
 
   return bot;
+}
+
+export async function registerBotCommands(bot: Bot<any>) {
+  try {
+    await bot.api.setMyCommands([
+      { command: "start", description: "Start the bot & submit documents" },
+      { command: "menu", description: "Open main navigation menu" },
+      { command: "jobs", description: "View your submitted print jobs & codes" },
+      { command: "status", description: "Check status of your active print job" },
+      { command: "name", description: "View or change your display name" },
+      { command: "clear", description: "Clear current draft & reset chat session" },
+      { command: "help", description: "Help guide, formats & instructions" },
+    ]);
+    console.log("✅ Registered native command menu with Telegram API");
+  } catch (err: any) {
+    console.warn("⚠️ Could not register bot commands with Telegram:", err.message);
+  }
 }
