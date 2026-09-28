@@ -20,6 +20,7 @@ import '../widgets/conversion_banner.dart';
 import '../widgets/libreoffice_approval_dialog.dart';
 import '../widgets/pdf_preview_dialog.dart';
 import '../widgets/image_preview_dialog.dart';
+import '../widgets/driver_diagnostics_dialog.dart';
 import '../widgets/settings_dialog.dart';
 import 'login_screen.dart';
 
@@ -997,7 +998,38 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(width: 8),
           PrinterStatusChip(
             status: _printerStatus,
+            isPrinting: _isPrinting,
+            currentJobCode: _selectedJob?.jobCode,
             onRefresh: _checkPrinter,
+          ),
+          const SizedBox(width: 8),
+          InkWell(
+            onTap: () => DriverDiagnosticsDialog.show(context),
+            borderRadius: BorderRadius.circular(20),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: AppTheme.accent.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: AppTheme.accent.withValues(alpha: 0.4)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.tune, size: 14, color: AppTheme.accent),
+                  SizedBox(width: 6),
+                  Text(
+                    '300 DPI · DRAFT',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      color: AppTheme.accent,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
           const SizedBox(width: 8),
           IconButton(

@@ -90,7 +90,7 @@ class StorageService {
 
   static Future<String> getGlobalQuality() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_keyGlobalQuality) ?? 'NORMAL';
+    return prefs.getString(_keyGlobalQuality) ?? 'DRAFT';
   }
 
   static Future<void> setGlobalQuality(String quality) async {
@@ -100,7 +100,7 @@ class StorageService {
 
   static Future<int> getGlobalDpi() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getInt(_keyGlobalDpi) ?? 600;
+    return prefs.getInt(_keyGlobalDpi) ?? 300;
   }
 
   static Future<void> setGlobalDpi(int dpi) async {

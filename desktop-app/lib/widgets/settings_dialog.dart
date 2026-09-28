@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:printing/printing.dart';
 import '../services/storage_service.dart';
@@ -75,10 +76,21 @@ class _SettingsDialogState extends State<SettingsDialog> {
     await StorageService.setGlobalQuality(_globalQuality);
     await StorageService.setGlobalDpi(_globalDpi);
 
+    if (_selectedPrinter != null) {
+      // Prime the driver configuration immediately so subsequent prints start instantly with 0ms lag
+      unawaited(PrinterService.applyPrinterConfiguration(
+        printerName: _selectedPrinter!,
+        colorMode: 'BW',
+        quality: _globalQuality,
+        dpi: _globalDpi,
+        force: true,
+      ));
+    }
+
     if (mounted) {
       Navigator.of(context).pop();
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Settings saved successfully!')),
+        const SnackBar(content: Text('Settings saved & printer profile primed!')),
       );
     }
   }

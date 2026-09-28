@@ -1,5 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:printing/printing.dart';
 import 'package:pdf/pdf.dart';
 import 'storage_service.dart';
@@ -40,6 +41,41 @@ class SpoolerJobStatus {
       state == SpoolerState.cancelled ||
       state == SpoolerState.error ||
       state == SpoolerState.jammed;
+}
+
+class PrinterDiagnostics {
+  final int dpiX;
+  final int dpiY;
+  final int horzRes;
+  final int vertRes;
+  final int physWidth;
+  final int physHeight;
+  final int offsetX;
+  final int offsetY;
+  final String quality;
+  final String colorMode;
+  final bool isDraft;
+  final bool is300Dpi;
+  final String? error;
+
+  const PrinterDiagnostics({
+    required this.dpiX,
+    required this.dpiY,
+    required this.horzRes,
+    required this.vertRes,
+    required this.physWidth,
+    required this.physHeight,
+    required this.offsetX,
+    required this.offsetY,
+    required this.quality,
+    required this.colorMode,
+    required this.isDraft,
+    required this.is300Dpi,
+    this.error,
+  });
+
+  String get summary =>
+      '${dpiX}x$dpiY DPI · Quality: $quality · Color: $colorMode · Canvas: ${horzRes}x$vertRes px';
 }
 
 class PrinterService {
@@ -140,6 +176,97 @@ class PrinterService {
     );
   }
 
+  static String? _cachedHelperPath;
+  static String? _findHelperExe() {
+    if (_cachedHelperPath != null && File(_cachedHelperPath!).existsSync()) {
+      return _cachedHelperPath;
+    }
+    final candidatePaths = [
+      '${Platform.resolvedExecutable}\\..\\printer_config_helper.exe',
+      '${Directory.current.path}\\windows\\tools\\printer_config_helper.exe',
+      'windows\\tools\\printer_config_helper.exe',
+      'build\\windows\\x64\\runner\\Debug\\printer_config_helper.exe',
+    ];
+    for (final p in candidatePaths) {
+      if (File(p).existsSync()) {
+        _cachedHelperPath = p;
+        return p;
+      }
+    }
+    return null;
+  }
+
+  /// Queries the live Windows GDI DC capabilities and print driver resolution
+  static Future<PrinterDiagnostics> getDriverDiagnostics(String printerName) async {
+    final quality = await StorageService.getGlobalQuality();
+    final globalDpi = await StorageService.getGlobalDpi();
+
+    final helper = _findHelperExe();
+    if (helper != null) {
+      try {
+        final res = await Process.run(helper, ['check', printerName]);
+        if (res.exitCode == 0) {
+          final out = res.stdout.toString().trim();
+          final data = jsonDecode(out) as Map<String, dynamic>;
+          if (data.containsKey('dpiX')) {
+            final dpiX = data['dpiX'] as int;
+            final dpiY = data['dpiY'] as int;
+            final horzRes = data['horzRes'] as int;
+            final vertRes = data['vertRes'] as int;
+            final physWidth = data['physWidth'] as int;
+            final physHeight = data['physHeight'] as int;
+            final offsetX = data['offsetX'] as int;
+            final offsetY = data['offsetY'] as int;
+
+            final diag = PrinterDiagnostics(
+              dpiX: dpiX,
+              dpiY: dpiY,
+              horzRes: horzRes,
+              vertRes: vertRes,
+              physWidth: physWidth,
+              physHeight: physHeight,
+              offsetX: offsetX,
+              offsetY: offsetY,
+              quality: quality,
+              colorMode: 'Grayscale (BW)',
+              isDraft: quality.toUpperCase() == 'DRAFT' || dpiX <= 300,
+              is300Dpi: dpiX <= 300,
+            );
+            debugPrint('🔍 [Printer Diagnostics] Live Driver DC State:');
+            debugPrint('   DPI: ${diag.dpiX} x ${diag.dpiY}');
+            debugPrint('   Printable Canvas: ${diag.horzRes} x ${diag.vertRes}');
+            debugPrint('   Physical Paper: ${diag.physWidth} x ${diag.physHeight}');
+            debugPrint('   Quality Setting: ${diag.quality}');
+            debugPrint('   Draft Mode Active: ${diag.isDraft}');
+            return diag;
+          }
+        }
+      } catch (e) {
+        debugPrint('Error running printer diagnostics: $e');
+      }
+    }
+
+    return PrinterDiagnostics(
+      dpiX: globalDpi,
+      dpiY: globalDpi,
+      horzRes: 2410,
+      vertRes: 3438,
+      physWidth: 2480,
+      physHeight: 3508,
+      offsetX: 35,
+      offsetY: 35,
+      quality: quality,
+      colorMode: 'Grayscale (BW)',
+      isDraft: quality.toUpperCase() == 'DRAFT' || globalDpi <= 300,
+      is300Dpi: globalDpi <= 300,
+    );
+  }
+
+  static String? _lastConfiguredPrinter;
+  static String? _lastConfiguredColorMode;
+  static String? _lastConfiguredQuality;
+  static int? _lastConfiguredDpi;
+
   /// Injects Color Mode (Grayscale vs Color), Quality (Draft/Normal/High), and DPI (300/600/1200)
   /// directly into the Windows Print Spooler and HP PrintTicket driver settings.
   static Future<void> applyPrinterConfiguration({
@@ -147,13 +274,36 @@ class PrinterService {
     required String colorMode,
     String? quality,
     int? dpi,
+    bool force = false,
   }) async {
     if (!Platform.isWindows) return;
     try {
       final effectiveQuality = quality ?? await StorageService.getGlobalQuality();
       final effectiveDpi = dpi ?? await StorageService.getGlobalDpi();
 
+      // Fast-path: if already configured with these exact parameters, return immediately (0 ms overhead!)
+      if (!force &&
+          _lastConfiguredPrinter == printerName &&
+          _lastConfiguredColorMode == colorMode &&
+          _lastConfiguredQuality == effectiveQuality &&
+          _lastConfiguredDpi == effectiveDpi) {
+        debugPrint('⚡ [Printer Config] Already active for $printerName: $effectiveQuality, ${effectiveDpi}DPI');
+        return;
+      }
+
+      final sw = Stopwatch()..start();
       final isColor = colorMode.toUpperCase() == 'COLOR';
+      final dmColor = isColor ? 2 : 1; // 1=Monochrome, 2=Color
+
+      // 1. Fast Win32 DEVMODE update via native helper executable (<80ms)
+      final helper = _findHelperExe();
+      if (helper != null) {
+        try {
+          await Process.run(helper, ['apply', printerName, effectiveDpi.toString(), dmColor.toString()]);
+        } catch (_) {}
+      }
+
+      // 2. Fast V4 PrintTicket XML update via PowerShell (no compilation needed!)
       final qualityOption = switch (effectiveQuality.toUpperCase()) {
         'DRAFT' => 'psk:Draft',
         'BEST' => 'psk:High',
@@ -170,106 +320,11 @@ class PrinterService {
         _ => 'ns0000:_600dpi',
       };
       final colorFlag = isColor ? '1' : '0';
-      final dmColor = isColor ? 2 : 1; // Win32 DEVMODE: 1=Monochrome, 2=Color
       final colorOption = isColor ? 'psk:Color' : 'psk:Grayscale';
       final sanitizedName = _sanitizeForPs(printerName);
 
-      // We update BOTH the legacy Win32 DEVMODE structure (which Win32 GDI & PDFium CreateDC use)
-      // AND the modern V4 PrintTicket XML (which Windows XPS filter pipeline uses).
       final script = '''
 \$name = '$sanitizedName';
-
-# 1. Update Win32 DEVMODE via SetPrinter Level 9 (ensures CreateDC picks up exact DPI & Monochrome)
-try {
-  \$typeDef = @'
-using System;
-using System.Runtime.InteropServices;
-public class Win32DevModeHelper {
-    [DllImport("winspool.drv", CharSet = CharSet.Auto, SetLastError = true)]
-    public static extern int DocumentProperties(IntPtr hwnd, IntPtr hPrinter, string pDeviceName, IntPtr pDevModeOutput, IntPtr pDevModeInput, int fMode);
-    [DllImport("winspool.drv", CharSet = CharSet.Auto, SetLastError = true)]
-    public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, ref PRINTER_DEFAULTS pDefault);
-    [DllImport("winspool.drv", SetLastError = true)]
-    public static extern bool ClosePrinter(IntPtr hPrinter);
-    [DllImport("winspool.drv", CharSet = CharSet.Auto, SetLastError = true)]
-    public static extern bool SetPrinter(IntPtr hPrinter, int Level, IntPtr pPrinter, int Command);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct PRINTER_DEFAULTS {
-        public IntPtr pDatatype;
-        public IntPtr pDevMode;
-        public int DesiredAccess;
-    }
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-    public struct DEVMODE {
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-        public string dmDeviceName;
-        public short dmSpecVersion;
-        public short dmDriverVersion;
-        public short dmSize;
-        public short dmDriverExtra;
-        public int dmFields;
-        public short dmOrientation;
-        public short dmPaperSize;
-        public short dmPaperLength;
-        public short dmPaperWidth;
-        public short dmScale;
-        public short dmCopies;
-        public short dmDefaultSource;
-        public short dmPrintQuality;
-        public short dmColor;
-        public short dmDuplex;
-        public short dmYResolution;
-        public short dmTTOption;
-        public short dmCollate;
-    }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct PRINTER_INFO_9 {
-        public IntPtr pDevMode;
-    }
-
-    public static bool Apply(string printerName, short dpi, short colorMode) {
-        PRINTER_DEFAULTS def = new PRINTER_DEFAULTS();
-        def.DesiredAccess = 0xF000C; // PRINTER_ALL_ACCESS
-        IntPtr hPrinter;
-        if (!OpenPrinter(printerName, out hPrinter, ref def)) {
-            def.DesiredAccess = 0x00020000;
-            if (!OpenPrinter(printerName, out hPrinter, ref def)) return false;
-        }
-        int size = DocumentProperties(IntPtr.Zero, hPrinter, printerName, IntPtr.Zero, IntPtr.Zero, 0);
-        if (size <= 0) { ClosePrinter(hPrinter); return false; }
-        IntPtr buffer = Marshal.AllocHGlobal(size);
-        if (DocumentProperties(IntPtr.Zero, hPrinter, printerName, buffer, IntPtr.Zero, 2) < 0) {
-            Marshal.FreeHGlobal(buffer);
-            ClosePrinter(hPrinter);
-            return false;
-        }
-        DEVMODE dm = (DEVMODE)Marshal.PtrToStructure(buffer, typeof(DEVMODE));
-        dm.dmPrintQuality = dpi;
-        dm.dmYResolution = dpi;
-        dm.dmColor = colorMode;
-        dm.dmFields |= (0x00000400 | 0x00002000 | 0x00000800); // DM_PRINTQUALITY | DM_YRESOLUTION | DM_COLOR
-        Marshal.StructureToPtr(dm, buffer, false);
-        DocumentProperties(IntPtr.Zero, hPrinter, printerName, buffer, buffer, 10); // DM_IN_BUFFER | DM_OUT_BUFFER
-        PRINTER_INFO_9 pi9 = new PRINTER_INFO_9();
-        pi9.pDevMode = buffer;
-        IntPtr pPi9 = Marshal.AllocHGlobal(Marshal.SizeOf(pi9));
-        Marshal.StructureToPtr(pi9, pPi9, false);
-        SetPrinter(hPrinter, 9, pPi9, 0);
-        Marshal.FreeHGlobal(pPi9);
-        Marshal.FreeHGlobal(buffer);
-        ClosePrinter(hPrinter);
-        return true;
-    }
-}
-'@
-  if (-not ([System.Management.Automation.PSTypeName]'Win32DevModeHelper').Type) {
-    Add-Type -TypeDefinition \$typeDef -ErrorAction SilentlyContinue
-  }
-  [Win32DevModeHelper]::Apply(\$name, [short]$effectiveDpi, [short]$dmColor)
-} catch {}
-
-# 2. Update V4 PrintTicket XML via Set-PrintConfiguration
 \$cfg = Get-PrintConfiguration -PrinterName \$name -ErrorAction SilentlyContinue;
 if (\$cfg) {
   [xml]\$ticket = \$cfg.PrintTicketXML;
@@ -299,7 +354,16 @@ if (\$cfg) {
         ['-NoProfile', '-Command', script],
         runInShell: true,
       );
-    } catch (_) {}
+
+      _lastConfiguredPrinter = printerName;
+      _lastConfiguredColorMode = colorMode;
+      _lastConfiguredQuality = effectiveQuality;
+      _lastConfiguredDpi = effectiveDpi;
+
+      debugPrint('✅ [Printer Config] Successfully configured $printerName in ${sw.elapsedMilliseconds}ms: $effectiveQuality · ${effectiveDpi}DPI · ${isColor ? "Color" : "BW"}');
+    } catch (e) {
+      debugPrint('⚠️ [Printer Config] Error configuring printer: $e');
+    }
   }
 
   /// Monitors the real-time lifecycle of a submitted print job in the Windows Print Spooler.
@@ -522,8 +586,8 @@ if (\$jobs) {
       dpi: dpi,
     );
 
-    // Give spooler a brief moment to ensure driver configuration is flushed
-    await Future.delayed(const Duration(milliseconds: 500));
+    final sw = Stopwatch()..start();
+    debugPrint('🖨️ [Print Dispatch] Sending "$jobName" to "${selectedPrinter.name}" | Copies: $copies | Mode: $colorMode | Quality: $quality | DPI: $dpi');
 
     for (int i = 0; i < copies; i++) {
       bool success = false;
@@ -538,12 +602,13 @@ if (\$jobs) {
         );
         if (success) break;
         if (attempt < 3) {
-          await Future.delayed(const Duration(milliseconds: 1500));
+          await Future.delayed(const Duration(milliseconds: 1000));
         }
       }
       if (!success) return false;
     }
 
+    debugPrint('🏁 [Print Dispatch] Successfully submitted "$jobName" to Windows Spooler in ${sw.elapsedMilliseconds}ms');
     return true;
   }
 

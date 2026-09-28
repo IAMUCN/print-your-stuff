@@ -4,11 +4,15 @@ import '../theme/app_theme.dart';
 
 class PrinterStatusChip extends StatelessWidget {
   final PrinterConnectionStatus status;
+  final bool isPrinting;
+  final int? currentJobCode;
   final VoidCallback onRefresh;
 
   const PrinterStatusChip({
     super.key,
     required this.status,
+    this.isPrinting = false,
+    this.currentJobCode,
     required this.onRefresh,
   });
 
@@ -17,19 +21,26 @@ class PrinterStatusChip extends StatelessWidget {
     Color dotColor;
     String text;
 
-    switch (status) {
-      case PrinterConnectionStatus.online:
-        dotColor = Colors.greenAccent;
-        text = 'PRINTER: ONLINE';
-        break;
-      case PrinterConnectionStatus.offline:
-        dotColor = Colors.redAccent;
-        text = 'PRINTER: OFFLINE';
-        break;
-      case PrinterConnectionStatus.checking:
-        dotColor = AppTheme.textSecondary;
-        text = 'CHECKING...';
-        break;
+    if (isPrinting) {
+      dotColor = Colors.amberAccent;
+      text = currentJobCode != null
+          ? 'PRINTING #$currentJobCode...'
+          : 'PRINTING...';
+    } else {
+      switch (status) {
+        case PrinterConnectionStatus.online:
+          dotColor = Colors.greenAccent;
+          text = 'PRINTER: READY';
+          break;
+        case PrinterConnectionStatus.offline:
+          dotColor = Colors.redAccent;
+          text = 'PRINTER: OFFLINE';
+          break;
+        case PrinterConnectionStatus.checking:
+          dotColor = AppTheme.textSecondary;
+          text = 'CHECKING...';
+          break;
+      }
     }
 
     return InkWell(
