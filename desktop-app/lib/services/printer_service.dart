@@ -170,11 +170,106 @@ class PrinterService {
         _ => 'ns0000:_600dpi',
       };
       final colorFlag = isColor ? '1' : '0';
+      final dmColor = isColor ? 2 : 1; // Win32 DEVMODE: 1=Monochrome, 2=Color
       final colorOption = isColor ? 'psk:Color' : 'psk:Grayscale';
       final sanitizedName = _sanitizeForPs(printerName);
 
+      // We update BOTH the legacy Win32 DEVMODE structure (which Win32 GDI & PDFium CreateDC use)
+      // AND the modern V4 PrintTicket XML (which Windows XPS filter pipeline uses).
       final script = '''
 \$name = '$sanitizedName';
+
+# 1. Update Win32 DEVMODE via SetPrinter Level 9 (ensures CreateDC picks up exact DPI & Monochrome)
+try {
+  \$typeDef = @'
+using System;
+using System.Runtime.InteropServices;
+public class Win32DevModeHelper {
+    [DllImport("winspool.drv", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern int DocumentProperties(IntPtr hwnd, IntPtr hPrinter, string pDeviceName, IntPtr pDevModeOutput, IntPtr pDevModeInput, int fMode);
+    [DllImport("winspool.drv", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, ref PRINTER_DEFAULTS pDefault);
+    [DllImport("winspool.drv", SetLastError = true)]
+    public static extern bool ClosePrinter(IntPtr hPrinter);
+    [DllImport("winspool.drv", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern bool SetPrinter(IntPtr hPrinter, int Level, IntPtr pPrinter, int Command);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PRINTER_DEFAULTS {
+        public IntPtr pDatatype;
+        public IntPtr pDevMode;
+        public int DesiredAccess;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    public struct DEVMODE {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string dmDeviceName;
+        public short dmSpecVersion;
+        public short dmDriverVersion;
+        public short dmSize;
+        public short dmDriverExtra;
+        public int dmFields;
+        public short dmOrientation;
+        public short dmPaperSize;
+        public short dmPaperLength;
+        public short dmPaperWidth;
+        public short dmScale;
+        public short dmCopies;
+        public short dmDefaultSource;
+        public short dmPrintQuality;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PRINTER_INFO_9 {
+        public IntPtr pDevMode;
+    }
+
+    public static bool Apply(string printerName, short dpi, short colorMode) {
+        PRINTER_DEFAULTS def = new PRINTER_DEFAULTS();
+        def.DesiredAccess = 0xF000C; // PRINTER_ALL_ACCESS
+        IntPtr hPrinter;
+        if (!OpenPrinter(printerName, out hPrinter, ref def)) {
+            def.DesiredAccess = 0x00020000;
+            if (!OpenPrinter(printerName, out hPrinter, ref def)) return false;
+        }
+        int size = DocumentProperties(IntPtr.Zero, hPrinter, printerName, IntPtr.Zero, IntPtr.Zero, 0);
+        if (size <= 0) { ClosePrinter(hPrinter); return false; }
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        if (DocumentProperties(IntPtr.Zero, hPrinter, printerName, buffer, IntPtr.Zero, 2) < 0) {
+            Marshal.FreeHGlobal(buffer);
+            ClosePrinter(hPrinter);
+            return false;
+        }
+        DEVMODE dm = (DEVMODE)Marshal.PtrToStructure(buffer, typeof(DEVMODE));
+        dm.dmPrintQuality = dpi;
+        dm.dmYResolution = dpi;
+        dm.dmColor = colorMode;
+        dm.dmFields |= (0x00000400 | 0x00002000 | 0x00000800); // DM_PRINTQUALITY | DM_YRESOLUTION | DM_COLOR
+        Marshal.StructureToPtr(dm, buffer, false);
+        DocumentProperties(IntPtr.Zero, hPrinter, printerName, buffer, buffer, 10); // DM_IN_BUFFER | DM_OUT_BUFFER
+        PRINTER_INFO_9 pi9 = new PRINTER_INFO_9();
+        pi9.pDevMode = buffer;
+        IntPtr pPi9 = Marshal.AllocHGlobal(Marshal.SizeOf(pi9));
+        Marshal.StructureToPtr(pi9, pPi9, false);
+        SetPrinter(hPrinter, 9, pPi9, 0);
+        Marshal.FreeHGlobal(pPi9);
+        Marshal.FreeHGlobal(buffer);
+        ClosePrinter(hPrinter);
+        return true;
+    }
+}
+'@
+  if (-not ([System.Management.Automation.PSTypeName]'Win32DevModeHelper').Type) {
+    Add-Type -TypeDefinition \$typeDef -ErrorAction SilentlyContinue
+  }
+  [Win32DevModeHelper]::Apply(\$name, [short]$effectiveDpi, [short]$dmColor)
+} catch {}
+
+# 2. Update V4 PrintTicket XML via Set-PrintConfiguration
 \$cfg = Get-PrintConfiguration -PrinterName \$name -ErrorAction SilentlyContinue;
 if (\$cfg) {
   [xml]\$ticket = \$cfg.PrintTicketXML;
@@ -427,14 +522,25 @@ if (\$jobs) {
       dpi: dpi,
     );
 
+    // Give spooler a brief moment to ensure driver configuration is flushed
+    await Future.delayed(const Duration(milliseconds: 500));
+
     for (int i = 0; i < copies; i++) {
-      final success = await Printing.directPrintPdf(
-        printer: selectedPrinter,
-        onLayout: (PdfPageFormat format) async => pdfBytes,
-        name: '${jobName}_copy_${i + 1}',
-        format: PdfPageFormat.a4,
-        usePrinterSettings: true,
-      );
+      bool success = false;
+      // Retry up to 3 times in case the Windows printer port or spooler handle is momentarily busy
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        success = await Printing.directPrintPdf(
+          printer: selectedPrinter,
+          onLayout: (PdfPageFormat format) async => pdfBytes,
+          name: '${jobName}_copy_${i + 1}',
+          format: PdfPageFormat.a4,
+          usePrinterSettings: true,
+        );
+        if (success) break;
+        if (attempt < 3) {
+          await Future.delayed(const Duration(milliseconds: 1500));
+        }
+      }
       if (!success) return false;
     }
 

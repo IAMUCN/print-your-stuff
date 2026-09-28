@@ -325,6 +325,190 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  Future<void> _downloadFile(JobFile file) async {
+    if (_selectedJob == null) return;
+    try {
+      if (mounted) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('⏳ Downloading "${file.filename}"...'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+
+      final bytes = await ApiService.downloadFileBytes(_selectedJob!.id, file.id);
+      Directory? downloadsDir;
+      try {
+        downloadsDir = await getDownloadsDirectory();
+      } catch (_) {}
+      downloadsDir ??= Directory('${Platform.environment['USERPROFILE'] ?? 'C:\\Users\\Default'}\\Downloads');
+
+      if (!await downloadsDir.exists()) {
+        await downloadsDir.create(recursive: true);
+      }
+
+      String savePath = '${downloadsDir.path}\\${file.filename}';
+      int counter = 1;
+      final dotIdx = file.filename.lastIndexOf('.');
+      final fileBase = dotIdx != -1 ? file.filename.substring(0, dotIdx) : file.filename;
+      final ext = dotIdx != -1 ? file.filename.substring(dotIdx) : '';
+
+      while (await File(savePath).exists()) {
+        savePath = '${downloadsDir.path}\\${fileBase}_$counter$ext';
+        counter++;
+      }
+
+      final savedFile = File(savePath);
+      await savedFile.writeAsBytes(bytes);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('💾 Saved "${savedFile.uri.pathSegments.last}" to Downloads!'),
+          duration: const Duration(seconds: 8),
+          action: SnackBarAction(
+            label: 'OPEN FOLDER',
+            onPressed: () {
+              Process.run('explorer.exe', ['/select,', savedFile.path]);
+            },
+          ),
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to download file: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _printSingleFile(JobFile file, {bool useDialog = false}) async {
+    if (_selectedJob == null) return;
+    final job = _selectedJob!;
+
+    final globalQuality = await StorageService.getGlobalQuality();
+    final globalDpi = await StorageService.getGlobalDpi();
+
+    try {
+      if (mounted) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('🖨️ Preparing "${file.filename}" for printing...'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+
+      Uint8List pdfBytes;
+      if (file.inputType == 'IMAGE') {
+        try {
+          pdfBytes = await ApiService.downloadComposedPdfBytes(job.id);
+        } catch (_) {
+          pdfBytes = await _generateFallbackImagePdf(job);
+        }
+      } else if (file.inputType == 'DOCX' || file.inputType == 'DOC') {
+        final rawBytes = await ApiService.downloadFileBytes(job.id, file.id);
+        final tempDir = await getTemporaryDirectory();
+        final tempFile = File('${tempDir.path}\\${file.filename}');
+        await tempFile.writeAsBytes(rawBytes);
+        final convertedPdf = await LibreOfficeService.convertDocToPdf(tempFile);
+        pdfBytes = await convertedPdf.readAsBytes();
+      } else {
+        pdfBytes = await ApiService.downloadFileBytes(job.id, file.id);
+      }
+
+      final effectiveColorMode = file.settings.colorMode;
+      Uint8List printableBytes = pdfBytes;
+      if (effectiveColorMode.toUpperCase() == 'BW' && file.inputType == 'IMAGE') {
+        printableBytes = await _convertPdfToGrayscalePdf(pdfBytes);
+      }
+
+      final docJobName = 'Job_${job.jobCode}_${file.filename}';
+      final bool success;
+
+      if (useDialog) {
+        success = await PrinterService.printWithDialog(
+          pdfBytes: printableBytes,
+          jobName: docJobName,
+          colorMode: effectiveColorMode,
+          quality: globalQuality,
+          dpi: globalDpi,
+        );
+      } else {
+        success = await PrinterService.printPdfBytes(
+          pdfBytes: printableBytes,
+          jobName: docJobName,
+          copies: file.settings.copies,
+          colorMode: effectiveColorMode,
+          quality: globalQuality,
+          dpi: globalDpi,
+        );
+      }
+
+      if (!success) {
+        throw Exception('Windows print spooler rejected or cancelled ${file.filename}');
+      }
+
+      if (!useDialog) {
+        final targetPrinterName = await StorageService.getPrinterName();
+        final spoolerStatus = await PrinterService.trackJobCompletion(
+          printerName: targetPrinterName,
+          docPattern: 'Job_${job.jobCode}',
+          onProgress: (status) {
+            if (mounted && status.message != null) {
+              ScaffoldMessenger.of(context).hideCurrentSnackBar();
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('🖨️ ${status.message}'),
+                  duration: const Duration(seconds: 2),
+                ),
+              );
+            }
+          },
+        );
+
+        if (spoolerStatus.state == SpoolerState.cancelled) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('⚠️ Print of "${file.filename}" was CANCELLED at printer.'),
+                backgroundColor: Colors.orangeAccent.shade700,
+              ),
+            );
+          }
+          return;
+        }
+
+        if (spoolerStatus.state == SpoolerState.error || spoolerStatus.state == SpoolerState.jammed) {
+          throw Exception(spoolerStatus.message ?? 'Printer hardware error occurred');
+        }
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('✅ Successfully printed "${file.filename}"!')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error printing file: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _editFileSettings(JobFile file) async {
     if (_selectedJob == null) return;
 
@@ -560,8 +744,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       bool composedImagePrinted = false;
 
-      // Print each file in the job
-      for (final file in job.files) {
+      // Print each file in the job sequentially
+      for (int fIdx = 0; fIdx < job.files.length; fIdx++) {
+        final file = job.files[fIdx];
+
+        // Give the Windows Print Spooler and physical USB port 2.5 seconds to settle between documents
+        if (fIdx > 0) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('⏳ Preparing document ${fIdx + 1} of ${job.files.length}: ${file.filename}...'),
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          }
+          await Future.delayed(const Duration(milliseconds: 2500));
+        }
         Uint8List pdfBytes;
         if (file.inputType == 'IMAGE') {
           if (composedImagePrinted) {
@@ -1311,8 +1510,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             const SizedBox(height: 16),
             const Divider(),
             const SizedBox(height: 8),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
+            Wrap(
+              alignment: WrapAlignment.end,
+              spacing: 8,
+              runSpacing: 8,
               children: [
                 if (isDocx && allowEdit) ...[
                   OutlinedButton.icon(
@@ -1320,15 +1521,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     label: const Text('Convert to PDF'),
                     onPressed: () => _convertDocx(file),
                   ),
-                  const SizedBox(width: 10),
                 ],
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.download_outlined, size: 16),
+                  label: const Text('Download'),
+                  onPressed: () => _downloadFile(file),
+                ),
                 OutlinedButton.icon(
                   icon: const Icon(Icons.visibility_outlined, size: 16),
                   label: const Text('Preview'),
                   onPressed: () => _previewFile(file),
                 ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.print_outlined, size: 16),
+                  label: const Text('Print This File'),
+                  onPressed: () => _printSingleFile(file),
+                ),
                 if (allowEdit) ...[
-                  const SizedBox(width: 10),
                   OutlinedButton.icon(
                     icon: const Icon(Icons.edit_outlined, size: 16),
                     label: const Text('Edit Settings'),

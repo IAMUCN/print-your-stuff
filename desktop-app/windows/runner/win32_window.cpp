@@ -150,7 +150,10 @@ bool Win32Window::Create(const std::wstring& title,
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  BOOL res = ShowWindow(window_handle_, SW_SHOWNORMAL);
+  InvalidateRect(window_handle_, nullptr, TRUE);
+  UpdateWindow(window_handle_);
+  return res;
 }
 
 // static
