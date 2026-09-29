@@ -3,11 +3,13 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../models/job.dart';
 import '../services/api_service.dart';
+import '../services/logger_service.dart';
 import '../services/printer_service.dart';
 import '../services/storage_service.dart';
 import '../services/libreoffice_service.dart';
@@ -22,6 +24,7 @@ import '../widgets/libreoffice_approval_dialog.dart';
 import '../widgets/pdf_preview_dialog.dart';
 import '../widgets/image_preview_dialog.dart';
 import '../widgets/driver_diagnostics_dialog.dart';
+import '../widgets/logs_panel_dialog.dart';
 import '../widgets/settings_dialog.dart';
 import 'login_screen.dart';
 
@@ -154,6 +157,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
     // Ctrl + , : Settings Dialog
     if (isControlPressed && event.logicalKey == LogicalKeyboardKey.comma) {
       SettingsDialog.show(context);
+      return;
+    }
+
+    // Ctrl + L: System Logs & Error Diagnostics
+    if (isControlPressed && event.logicalKey == LogicalKeyboardKey.keyL) {
+      LogsPanelDialog.show(context);
       return;
     }
 
@@ -454,8 +463,33 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
     }
   }
 
+  Future<Directory> _getDownloadsDir() async {
+    Directory? dir;
+    try {
+      dir = await getDownloadsDirectory();
+    } catch (_) {}
+
+    if (dir == null || !dir.existsSync()) {
+      final userProfile = Platform.environment['USERPROFILE'] ?? 'C:\\Users\\Default';
+      dir = Directory(p.join(userProfile, 'Downloads'));
+    }
+
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
+
+  String _sanitizeFilename(String name) {
+    var clean = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+    if (clean.isEmpty) clean = 'document.pdf';
+    return clean;
+  }
+
   Future<void> _downloadFile(JobFile file) async {
     if (_selectedJob == null) return;
+    final job = _selectedJob!;
+
     try {
       if (mounted) {
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -467,30 +501,56 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
         );
       }
 
-      final bytes = await ApiService.downloadFileBytes(_selectedJob!.id, file.id);
-      Directory? downloadsDir;
-      try {
-        downloadsDir = await getDownloadsDirectory();
-      } catch (_) {}
-      downloadsDir ??= Directory('${Platform.environment['USERPROFILE'] ?? 'C:\\Users\\Default'}\\Downloads');
+      Uint8List bytes;
+      String targetFilename = file.filename;
 
-      if (!await downloadsDir.exists()) {
-        await downloadsDir.create(recursive: true);
+      if (file.inputType == 'IMAGE') {
+        LoggerService.instance.info(
+          'Downloading Composed PDF',
+          'Fetching composed PDF for image job #${job.jobCode}',
+          category: LogCategory.download,
+          jobCode: '${job.jobCode ?? ''}',
+        );
+        try {
+          bytes = await ApiService.downloadComposedPdfBytes(job.id);
+          targetFilename = 'Job_${job.jobCode ?? 'images'}_composed.pdf';
+        } catch (_) {
+          bytes = await _generateFallbackImagePdf(job);
+          targetFilename = 'Job_${job.jobCode ?? 'images'}_fallback.pdf';
+        }
+      } else {
+        LoggerService.instance.info(
+          'Downloading File',
+          'Fetching "${file.filename}" for job #${job.jobCode}',
+          category: LogCategory.download,
+          jobCode: '${job.jobCode ?? ''}',
+        );
+        bytes = await ApiService.downloadFileBytes(job.id, file.id);
       }
 
-      String savePath = '${downloadsDir.path}\\${file.filename}';
-      int counter = 1;
-      final dotIdx = file.filename.lastIndexOf('.');
-      final fileBase = dotIdx != -1 ? file.filename.substring(0, dotIdx) : file.filename;
-      final ext = dotIdx != -1 ? file.filename.substring(dotIdx) : '';
+      final downloadsDir = await _getDownloadsDir();
+      final cleanName = _sanitizeFilename(targetFilename);
+      final dotIdx = cleanName.lastIndexOf('.');
+      final fileBase = dotIdx != -1 ? cleanName.substring(0, dotIdx) : cleanName;
+      final ext = dotIdx != -1 ? cleanName.substring(dotIdx) : '';
 
+      String savePath = p.join(downloadsDir.path, cleanName);
+      int counter = 1;
       while (await File(savePath).exists()) {
-        savePath = '${downloadsDir.path}\\${fileBase}_$counter$ext';
+        savePath = p.join(downloadsDir.path, '${fileBase}_$counter$ext');
         counter++;
       }
 
       final savedFile = File(savePath);
-      await savedFile.writeAsBytes(bytes);
+      await savedFile.writeAsBytes(bytes, flush: true);
+
+      LoggerService.instance.success(
+        'File Downloaded',
+        'Saved "${savedFile.uri.pathSegments.last}" (${(bytes.length / 1024).toStringAsFixed(1)} KB)',
+        details: 'Saved to: ${savedFile.path}',
+        category: LogCategory.download,
+        jobCode: '${job.jobCode ?? ''}',
+      );
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -499,22 +559,316 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
           content: Text('💾 Saved "${savedFile.uri.pathSegments.last}" to Downloads!'),
           duration: const Duration(seconds: 8),
           action: SnackBarAction(
-            label: 'OPEN FOLDER',
+            label: 'OPEN FILE',
+            textColor: Colors.greenAccent,
             onPressed: () {
-              Process.run('explorer.exe', ['/select,', savedFile.path]);
+              Process.run('explorer.exe', [savedFile.path]);
             },
           ),
         ),
       );
-    } catch (e) {
+    } catch (e, st) {
+      LoggerService.instance.error(
+        'Download Failed',
+        'Failed to download "${file.filename}": $e',
+        details: '$st',
+        category: LogCategory.download,
+        jobCode: '${job.jobCode ?? ''}',
+      );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Failed to download file: $e'),
             backgroundColor: Colors.redAccent,
+            duration: const Duration(seconds: 6),
+            action: SnackBarAction(
+              label: 'VIEW LOGS',
+              textColor: Colors.white,
+              onPressed: () => LogsPanelDialog.show(context),
+            ),
           ),
         );
       }
+    }
+  }
+
+  Future<void> _downloadJob(PrintJob job) async {
+    try {
+      if (mounted) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('⏳ Downloading files for Job #${job.jobCode}...'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+
+      final downloadsDir = await _getDownloadsDir();
+
+      // Case 1: Job has images -> Download composed PDF
+      final hasImages = job.files.any((f) => f.inputType == 'IMAGE');
+      if (hasImages) {
+        Uint8List pdfBytes;
+        try {
+          pdfBytes = await ApiService.downloadComposedPdfBytes(job.id);
+        } catch (_) {
+          pdfBytes = await _generateFallbackImagePdf(job);
+        }
+
+        final cleanName = _sanitizeFilename('Job_${job.jobCode ?? 'images'}_composed.pdf');
+        final savedFile = File(p.join(downloadsDir.path, cleanName));
+        await savedFile.writeAsBytes(pdfBytes, flush: true);
+
+        LoggerService.instance.success(
+          'Job PDF Downloaded',
+          'Saved composed PDF for Job #${job.jobCode}',
+          details: 'Saved to: ${savedFile.path}',
+          category: LogCategory.download,
+          jobCode: '${job.jobCode ?? ''}',
+        );
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('💾 Saved "${savedFile.uri.pathSegments.last}" to Downloads!'),
+            duration: const Duration(seconds: 8),
+            action: SnackBarAction(
+              label: 'OPEN FILE',
+              textColor: Colors.greenAccent,
+              onPressed: () => Process.run('explorer.exe', [savedFile.path]),
+            ),
+          ),
+        );
+        return;
+      }
+
+      // Case 2: Single PDF
+      if (job.files.length == 1) {
+        await _downloadFile(job.files.first);
+        return;
+      }
+
+      // Case 3: Multiple files -> create dedicated subfolder
+      final folderName = _sanitizeFilename('Job_${job.jobCode ?? 'print'}_${job.studentName}');
+      final jobFolder = Directory(p.join(downloadsDir.path, folderName));
+      if (!await jobFolder.exists()) {
+        await jobFolder.create(recursive: true);
+      }
+
+      int downloadedCount = 0;
+      for (final file in job.files) {
+        final bytes = await ApiService.downloadFileBytes(job.id, file.id);
+        final safeName = _sanitizeFilename(file.filename);
+        final fileDest = File(p.join(jobFolder.path, safeName));
+        await fileDest.writeAsBytes(bytes, flush: true);
+        downloadedCount++;
+      }
+
+      LoggerService.instance.success(
+        'All Job Files Downloaded',
+        'Saved $downloadedCount file(s) for Job #${job.jobCode} into folder "$folderName"',
+        details: 'Folder: ${jobFolder.path}',
+        category: LogCategory.download,
+        jobCode: '${job.jobCode ?? ''}',
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('💾 Downloaded $downloadedCount files to "$folderName"!'),
+          duration: const Duration(seconds: 8),
+          action: SnackBarAction(
+            label: 'OPEN FOLDER',
+            textColor: Colors.greenAccent,
+            onPressed: () => Process.run('explorer.exe', [jobFolder.path]),
+          ),
+        ),
+      );
+    } catch (e, st) {
+      LoggerService.instance.error(
+        'Job Download Failed',
+        'Failed to download files for Job #${job.jobCode}: $e',
+        details: '$st',
+        category: LogCategory.download,
+        jobCode: '${job.jobCode ?? ''}',
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to download job: $e'),
+            backgroundColor: Colors.redAccent,
+            duration: const Duration(seconds: 6),
+            action: SnackBarAction(
+              label: 'VIEW LOGS',
+              textColor: Colors.white,
+              onPressed: () => LogsPanelDialog.show(context),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteJob(PrintJob job) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: AppTheme.border),
+        ),
+        title: Row(
+          children: [
+            const Icon(Icons.delete_outline, color: Colors.redAccent, size: 22),
+            const SizedBox(width: 10),
+            Text('Delete Job #${job.jobCode ?? '---'}?'),
+          ],
+        ),
+        content: Text(
+          'Are you sure you want to permanently delete job #${job.jobCode} for "${job.studentName}"?\n\nThis will remove the job and all associated files from the completed history.',
+          style: TextStyle(color: Colors.grey[300], fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      await ApiService.deleteJob(job.id);
+      LoggerService.instance.info(
+        'Job Deleted',
+        'Permanently deleted completed job #${job.jobCode} (${job.studentName})',
+        category: LogCategory.system,
+        jobCode: '${job.jobCode ?? ''}',
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _history.removeWhere((j) => j.id == job.id);
+        _queue.removeWhere((j) => j.id == job.id);
+        if (_selectedJob?.id == job.id) {
+          final currentList = _currentTab == DashboardTab.activeQueue ? _filteredQueue : _filteredHistory;
+          _selectedJob = currentList.isNotEmpty ? currentList.first : null;
+        }
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('🗑️ Job #${job.jobCode ?? '---'} deleted.'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } catch (e, st) {
+      LoggerService.instance.error(
+        'Failed to Delete Job',
+        'Error deleting job #${job.jobCode}: $e',
+        details: '$st',
+        category: LogCategory.network,
+        jobCode: '${job.jobCode ?? ''}',
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to delete job: $e'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    }
+  }
+
+  Future<void> _clearAllCompletedJobs() async {
+    if (_history.isEmpty) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: AppTheme.border),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.delete_sweep_outlined, color: Colors.redAccent, size: 22),
+            SizedBox(width: 10),
+            Text('Clear All Completed Jobs?'),
+          ],
+        ),
+        content: Text(
+          'This will permanently delete all ${_history.length} completed, failed, and cancelled jobs from history.\n\nActive pending jobs in the queue will NOT be affected.',
+          style: TextStyle(color: Colors.grey[300], fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Clear All'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      final count = await ApiService.clearAllCompletedJobs();
+      LoggerService.instance.info(
+        'History Cleared',
+        'Purged $count completed jobs from history',
+        category: LogCategory.system,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _history.clear();
+        if (_currentTab == DashboardTab.completedJobs) {
+          _selectedJob = null;
+        }
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('🧹 Cleared $count completed jobs from history.'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e, st) {
+      LoggerService.instance.error(
+        'Failed to Clear History',
+        'Error purging completed jobs: $e',
+        details: '$st',
+        category: LogCategory.network,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to clear completed jobs: $e'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
     }
   }
 
@@ -708,12 +1062,26 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
         await _refreshAll(silent: true);
       }
 
+      LoggerService.instance.success(
+        'File Printed',
+        'Successfully spooled and completed "${file.filename}" for Job #${job.jobCode}',
+        category: LogCategory.print,
+        jobCode: '${job.jobCode ?? ''}',
+      );
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('✅ Successfully printed "${file.filename}"!')),
         );
       }
-    } catch (e) {
+    } catch (e, st) {
+      LoggerService.instance.error(
+        'Print File Failed',
+        'Failed to print "${file.filename}" for Job #${job.jobCode}: $e',
+        details: '$st',
+        category: LogCategory.print,
+        jobCode: '${job.jobCode ?? ''}',
+      );
       _updateLocalFileStatus(file.id, 'FAILED', errorMessage: e.toString());
       await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: e.toString());
       if (mounted) {
@@ -721,6 +1089,11 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
           SnackBar(
             content: Text('Error printing file: $e'),
             backgroundColor: Colors.redAccent,
+            action: SnackBarAction(
+              label: 'VIEW LOGS',
+              textColor: Colors.white,
+              onPressed: () => LogsPanelDialog.show(context),
+            ),
           ),
         );
       }
@@ -1093,6 +1466,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
 
       final printerName = await StorageService.getPrinterName();
       await ApiService.updateStatus(job.id, 'PRINTED', printerName: printerName);
+      LoggerService.instance.success(
+        'Print Job Completed',
+        'Job #${job.jobCode} for ${job.studentName} (${job.files.length} file(s)) printed successfully.',
+        category: LogCategory.print,
+        jobCode: '${job.jobCode ?? ''}',
+      );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('✅ Job #${job.jobCode} printed successfully!')),
@@ -1114,20 +1493,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
           }
         });
       }
-    } catch (e) {
+    } catch (e, st) {
+      LoggerService.instance.error(
+        'Print Job Failed',
+        'Print failed for Job #${job.jobCode}: $e',
+        details: '$st',
+        category: LogCategory.print,
+        jobCode: '${job.jobCode ?? ''}',
+      );
       await ApiService.updateStatus(job.id, 'FAILED', errorMessage: e.toString());
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Print failed: $e'),
             duration: const Duration(seconds: 8),
-            action: !useDialog
-                ? SnackBarAction(
-                    label: 'Open Dialog',
-                    textColor: Colors.yellowAccent,
-                    onPressed: () => _printJob(useDialog: true),
-                  )
-                : null,
+            action: SnackBarAction(
+              label: 'VIEW LOGS',
+              textColor: Colors.white,
+              onPressed: () => LogsPanelDialog.show(context),
+            ),
           ),
         );
       }
@@ -1282,6 +1666,50 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
               ),
             ),
             const SizedBox(width: 6),
+            ListenableBuilder(
+              listenable: LoggerService.instance,
+              builder: (context, _) {
+                final unreadErrors = LoggerService.instance.unreadErrorCount;
+                return Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        unreadErrors > 0 ? Icons.error_outline : Icons.receipt_long_outlined,
+                        color: unreadErrors > 0 ? Colors.redAccent : null,
+                      ),
+                      onPressed: () => LogsPanelDialog.show(context),
+                      tooltip: unreadErrors > 0
+                          ? '$unreadErrors System Error(s) - Click to inspect (Ctrl+L)'
+                          : 'System Activity & Error Logs (Ctrl+L)',
+                    ),
+                    if (unreadErrors > 0)
+                      Positioned(
+                        top: 6,
+                        right: 6,
+                        child: Container(
+                          padding: const EdgeInsets.all(3),
+                          decoration: const BoxDecoration(
+                            color: Colors.redAccent,
+                            shape: BoxShape.circle,
+                          ),
+                          constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                          child: Text(
+                            unreadErrors > 99 ? '99+' : '$unreadErrors',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 9,
+                              fontWeight: FontWeight.bold,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.settings_outlined),
               onPressed: () => SettingsDialog.show(context),
@@ -1446,6 +1874,33 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
                                   ),
                                 ),
                               ),
+                              if (_currentTab == DashboardTab.completedJobs && _history.isNotEmpty)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                                  color: AppTheme.surfaceElevated,
+                                  child: Row(
+                                    children: [
+                                      Text(
+                                        '${_history.length} completed jobs',
+                                        style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+                                      ),
+                                      const Spacer(),
+                                      TextButton.icon(
+                                        icon: const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.redAccent),
+                                        label: const Text(
+                                          'Clear All',
+                                          style: TextStyle(fontSize: 12, color: Colors.redAccent, fontWeight: FontWeight.bold),
+                                        ),
+                                        style: TextButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                          minimumSize: Size.zero,
+                                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                        ),
+                                        onPressed: _clearAllCompletedJobs,
+                                      ),
+                                    ],
+                                  ),
+                                ),
                               if (_loading)
                                 const Padding(
                                   padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -1556,6 +2011,16 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
         ),
         const PopupMenuDivider(),
         const PopupMenuItem(
+          value: 'download',
+          child: Row(
+            children: [
+              Icon(Icons.download_outlined, size: 18),
+              SizedBox(width: 8),
+              Text('Download PDF(s)'),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
           value: 'copy_code',
           child: Row(
             children: [
@@ -1578,6 +2043,19 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
             ),
           ),
         ],
+        if (_currentTab == DashboardTab.completedJobs) ...[
+          const PopupMenuDivider(),
+          const PopupMenuItem(
+            value: 'delete',
+            child: Row(
+              children: [
+                Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
+                SizedBox(width: 8),
+                Text('Delete Job', style: TextStyle(color: Colors.redAccent)),
+              ],
+            ),
+          ),
+        ],
       ],
     );
 
@@ -1587,6 +2065,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
       _printJob(useDialog: false);
     } else if (selected == 'print_dialog') {
       _printJob(useDialog: true);
+    } else if (selected == 'download') {
+      _downloadJob(job);
+    } else if (selected == 'delete') {
+      _deleteJob(job);
     } else if (selected == 'copy_code') {
       if (job.jobCode != null) {
         Clipboard.setData(ClipboardData(text: '#${job.jobCode}'));
@@ -1674,6 +2156,16 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
                   ),
                 ),
               ),
+              if (_currentTab == DashboardTab.completedJobs) ...[
+                const SizedBox(width: 4),
+                IconButton(
+                  icon: const Icon(Icons.delete_outline, size: 16, color: Colors.grey),
+                  hoverColor: Colors.redAccent.withValues(alpha: 0.15),
+                  splashRadius: 14,
+                  tooltip: 'Delete completed job',
+                  onPressed: () => _deleteJob(job),
+                ),
+              ],
             ],
           ),
         ),
@@ -1763,11 +2255,54 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
                       style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
                     ),
                   ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    icon: const Icon(Icons.download_outlined, size: 16),
+                    label: Text(job.files.length > 1 ? 'Download All (${job.files.length})' : 'Download PDF'),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                    onPressed: () => _downloadJob(job),
+                  ),
                 ],
               ),
             ],
           ),
         ),
+
+        if (job.status == 'FAILED')
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
+            color: Colors.redAccent.withValues(alpha: 0.12),
+            child: Row(
+              children: [
+                const Icon(Icons.error_outline, color: Colors.redAccent, size: 18),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    'This print job encountered a failure. You can download the PDF to print manually or inspect diagnostic error logs.',
+                    style: TextStyle(fontSize: 12, color: Colors.redAccent, fontWeight: FontWeight.w500),
+                  ),
+                ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.receipt_long_outlined, size: 14, color: Colors.redAccent),
+                  label: const Text('View Logs', style: TextStyle(color: Colors.redAccent)),
+                  onPressed: () => LogsPanelDialog.show(context),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.download_outlined, size: 14),
+                  label: const Text('Download PDF'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () => _downloadJob(job),
+                ),
+              ],
+            ),
+          ),
 
         // Files List
         Expanded(
@@ -1799,10 +2334,26 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
               ? Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    OutlinedButton.icon(
-                      icon: const Icon(Icons.replay, size: 18),
-                      label: const Text('Move to Active Queue'),
-                      onPressed: () => _moveToActiveQueue(job),
+                    Row(
+                      children: [
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.replay, size: 18),
+                          label: const Text('Move to Active Queue'),
+                          onPressed: () => _moveToActiveQueue(job),
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.download_outlined, size: 18),
+                          label: Text(job.files.length > 1 ? 'Download All' : 'Download PDF'),
+                          onPressed: () => _downloadJob(job),
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
+                          label: const Text('Delete Job', style: TextStyle(color: Colors.redAccent)),
+                          onPressed: () => _deleteJob(job),
+                        ),
+                      ],
                     ),
                     Row(
                       children: [
@@ -1829,10 +2380,20 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
               : Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    OutlinedButton.icon(
-                      icon: const Icon(Icons.cancel_outlined, size: 18, color: Colors.redAccent),
-                      label: const Text('Cancel Job', style: TextStyle(color: Colors.redAccent)),
-                      onPressed: _cancelJob,
+                    Row(
+                      children: [
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.cancel_outlined, size: 18, color: Colors.redAccent),
+                          label: const Text('Cancel Job', style: TextStyle(color: Colors.redAccent)),
+                          onPressed: _cancelJob,
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.download_outlined, size: 18),
+                          label: Text(job.files.length > 1 ? 'Download All' : 'Download PDF'),
+                          onPressed: () => _downloadJob(job),
+                        ),
+                      ],
                     ),
                     Row(
                       children: [
@@ -1912,12 +2473,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.info_outline, size: 14, color: Colors.redAccent),
+                    const Icon(Icons.error_outline, size: 14, color: Colors.redAccent),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
                         file.errorMessage!,
                         style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    InkWell(
+                      onTap: () => LogsPanelDialog.show(context),
+                      child: const Text(
+                        'VIEW LOGS',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.redAccent,
+                          decoration: TextDecoration.underline,
+                        ),
                       ),
                     ),
                   ],
@@ -1955,7 +2529,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
                 ],
                 OutlinedButton.icon(
                   icon: const Icon(Icons.download_outlined, size: 16),
-                  label: const Text('Download'),
+                  label: Text(file.inputType == 'IMAGE' ? 'Download PDF' : 'Download'),
                   onPressed: () => _downloadFile(file),
                 ),
                 OutlinedButton.icon(

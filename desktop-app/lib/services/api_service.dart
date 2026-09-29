@@ -142,7 +142,14 @@ class ApiService {
     if (response.statusCode == 200) {
       return response.bodyBytes;
     } else {
-      throw Exception('Failed to download file stream from backend (${response.statusCode})');
+      String serverError = response.body;
+      try {
+        final parsed = jsonDecode(response.body);
+        if (parsed is Map && parsed.containsKey('error')) {
+          serverError = parsed['error'].toString();
+        }
+      } catch (_) {}
+      throw Exception('HTTP ${response.statusCode}: $serverError');
     }
   }
 
@@ -155,7 +162,55 @@ class ApiService {
     if (response.statusCode == 200) {
       return response.bodyBytes;
     } else {
-      throw Exception('Failed to download composed image PDF (${response.statusCode})');
+      String serverError = response.body;
+      try {
+        final parsed = jsonDecode(response.body);
+        if (parsed is Map && parsed.containsKey('error')) {
+          serverError = parsed['error'].toString();
+        }
+      } catch (_) {}
+      throw Exception('HTTP ${response.statusCode}: $serverError');
+    }
+  }
+
+  static Future<bool> deleteJob(String jobId) async {
+    final baseUrl = await StorageService.getBackendUrl();
+    final url = Uri.parse('$baseUrl/api/v1/jobs/$jobId');
+
+    final response = await http.delete(url, headers: await _headers());
+
+    if (response.statusCode == 200) {
+      return true;
+    } else {
+      String serverError = response.body;
+      try {
+        final parsed = jsonDecode(response.body);
+        if (parsed is Map && parsed.containsKey('error')) {
+          serverError = parsed['error'].toString();
+        }
+      } catch (_) {}
+      throw Exception('Failed to delete job (HTTP ${response.statusCode}: $serverError)');
+    }
+  }
+
+  static Future<int> clearAllCompletedJobs() async {
+    final baseUrl = await StorageService.getBackendUrl();
+    final url = Uri.parse('$baseUrl/api/v1/jobs/history/all');
+
+    final response = await http.delete(url, headers: await _headers());
+
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return (data['count'] as num?)?.toInt() ?? 0;
+    } else {
+      String serverError = response.body;
+      try {
+        final parsed = jsonDecode(response.body);
+        if (parsed is Map && parsed.containsKey('error')) {
+          serverError = parsed['error'].toString();
+        }
+      } catch (_) {}
+      throw Exception('Failed to clear completed jobs (HTTP ${response.statusCode}: $serverError)');
     }
   }
 }

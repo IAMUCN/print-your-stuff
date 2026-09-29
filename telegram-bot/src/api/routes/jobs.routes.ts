@@ -256,25 +256,13 @@ export async function jobsRoutes(fastify: FastifyInstance, options?: { bot?: any
         });
       }
 
-      // Real-time Push Notification to student on Telegram!
-      if (options?.bot && job.user?.telegramUserId) {
+      // Minimal Telegram notification: ONLY send on completed PRINTED status to save bandwidth
+      if (options?.bot && job.user?.telegramUserId && status === "PRINTED") {
         try {
-          if (status === "PRINTED") {
-            await options.bot.api.sendMessage(
-              job.user.telegramUserId,
-              `Print job #${job.jobCode} printed.`
-            );
-          } else if (status === "CANCELLED") {
-            await options.bot.api.sendMessage(
-              job.user.telegramUserId,
-              `Print job #${job.jobCode} cancelled.`
-            );
-          } else if (status === "FAILED") {
-            await options.bot.api.sendMessage(
-              job.user.telegramUserId,
-              `Print job #${job.jobCode} failed.`
-            );
-          }
+          await options.bot.api.sendMessage(
+            job.user.telegramUserId,
+            `Print job #${job.jobCode} printed.`
+          );
         } catch (botNotifyErr) {
           request.log.warn(botNotifyErr, "Could not send Telegram notification to student");
         }
@@ -385,5 +373,32 @@ export async function jobsRoutes(fastify: FastifyInstance, options?: { bot?: any
       .returning();
 
     return { success: true, file: updated[0] };
+  });
+
+  // 9. Purge All Completed/History Jobs
+  fastify.delete("/history/all", async () => {
+    const deleted = await db
+      .delete(schema.jobs)
+      .where(inArray(schema.jobs.status, ["PRINTED", "PARTIALLY_PRINTED", "FAILED", "CANCELLED"]))
+      .returning({ id: schema.jobs.id });
+
+    return { success: true, count: deleted.length };
+  });
+
+  // 10. Delete a Single Job (cascades to files, settings, attempts, and events)
+  fastify.delete("/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+
+    const job = await db.query.jobs.findFirst({
+      where: eq(schema.jobs.id, id),
+    });
+
+    if (!job) {
+      return reply.status(404).send({ error: "Job not found" });
+    }
+
+    await db.delete(schema.jobs).where(eq(schema.jobs.id, id));
+
+    return { success: true, message: `Job ${job.jobCode || id} deleted successfully` };
   });
 }

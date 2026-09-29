@@ -234,3 +234,54 @@ HardwareCaps     : {"dpiX":300,"dpiY":300,"horzRes":2410,"vertRes":3438,"physWid
 - **Windows PrintTicket:** `psk:Draft` / `ns0000:_300dpi` / `_FastEco`
 - **Physical GDI Canvas:** `2410 x 3438` pixels at 300 DPI (Standard A4 printable area)
 - **Auto-Fit Scaler:** Active in PDFium (`print_job.cpp`)
+
+---
+
+## 10. ⚡ Bandwidth Optimization, Resilient File Downloads & Diagnostics Logging
+
+### A. Telegram Bot Notification Streamlining (Bandwidth Optimization)
+- **Problem:** Frequent status pushes ("printing", "queued", "cancelled", "failed") generated high polling traffic and exhausted Render cloud bandwidth.
+- **Decision & Fix:**
+  - Removed all intermediate status notifications sent to Telegram users.
+  - Streamlined the Telegram notification pipeline to send strictly one final message when printing succeeds:
+    ```
+    Print job #${job.jobCode} printed.
+    ```
+  - Eliminated backend notification overhead for cancelled or failed jobs, drastically reducing bandwidth consumption while keeping the Telegram bot clean and quiet.
+
+### B. Resilient File & Job Downloads
+- **Problem:** The previous desktop file download feature failed silently or threw errors when attempting to save files with special characters or when downloading jobs containing image files.
+- **Decision & Fix:**
+  - **Filename Sanitization:** Integrated Windows-compliant filename sanitization (`[\\/:*?"<>|]` and control characters stripped, whitespaces trimmed).
+  - **Single & Multi-File Architecture:**
+    - Single document downloads save cleanly to `%USERPROFILE%\Downloads` with auto-incremented counters if duplicate filenames exist (`document (1).pdf`).
+    - Multi-file jobs download into a structured subfolder (`Job_<Code>_<StudentName>`).
+    - For jobs composed from images or non-direct PDFs, the app automatically calls the `/composed-pdf` endpoint to retrieve and download the compiled, print-ready PDF.
+  - **Native Explorer Integration:** Interactive SnackBar buttons ("OPEN FILE" and "OPEN FOLDER") immediately reveal downloaded assets in Windows Explorer or open them directly in the default viewer.
+
+### C. Persistent In-App Diagnostics & Error Logging (`LoggerService` & `LogsPanelDialog`)
+- **Problem:** When spooler errors, download issues, or network drops occurred, error details were lost or hard to diagnose in the field.
+- **Decision & Fix:**
+  - **`LoggerService` Singleton:**
+    - Categorizes logs (`PRINT`, `NETWORK`, `SYSTEM`, `DOWNLOAD`, `SPOOLER`) with severity levels (`INFO`, `WARNING`, `ERROR`).
+    - In-memory circular buffer of 500 entries for responsive UI rendering.
+    - Persistent file logging to `%LOCALAPPDATA%\HostelPrintAdmin\logs\hostel_print_admin.log`.
+    - Real-time unread error badge in the AppBar alerting the operator to issues without intrusive popups.
+  - **`LogsPanelDialog` (`Ctrl + L`):**
+    - Filter chips by category and error level.
+    - Full-text search across log messages and stack traces.
+    - One-click "Copy All", "Open Log in Notepad", and "Clear Logs" actions.
+  - **Failed Job Context Banner:** Jobs marked as `FAILED` display an in-card diagnostic banner with quick-action buttons to open the log panel or download the PDF for manual printing.
+
+### D. Completed Tab History & Job Deletion
+- **Problem:** Completed and failed jobs cluttered the Completed tab with no way to remove them.
+- **Decision & Fix:**
+  - **Backend API Endpoints:**
+    - `DELETE /api/v1/jobs/:id` — Permanently removes a specific job and cascades across files, print settings, attempts, and events.
+    - `DELETE /api/v1/jobs/history/all` — Purges all completed, failed, and cancelled jobs in one batch.
+  - **Desktop UI Controls:**
+    - Individual delete icon buttons directly on completed job list tiles.
+    - Delete button in the job detail action bar.
+    - Right-click context menu "Delete Job" action.
+    - "Clear All" batch purge bar at the top of the Completed tab with confirmation dialog.
+
