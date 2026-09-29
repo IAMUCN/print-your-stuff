@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard, session, SessionFlavor, Context } from "grammy";
 import { config } from "../config.js";
 import { db, schema } from "../db/index.js";
-import { eq, and, desc, sql } from "drizzle-orm";
+import { eq, and, desc, asc, inArray, sql } from "drizzle-orm";
 import { PdfService } from "../services/pdf.service.js";
 import { TelegramFileService } from "../services/telegram-file.service.js";
 
@@ -149,34 +149,40 @@ export function createBot(): Bot<BotContext> {
     const user = await getDbUser(ctx);
     if (!user) return ctx.reply("Please type /start first to register.");
 
-    const waitingJob = await db.query.jobs.findFirst({
-      where: and(eq(schema.jobs.userId, user.id), eq(schema.jobs.status, "WAITING")),
-      orderBy: [desc(schema.jobs.createdAt)],
-    });
-
-    if (waitingJob) {
-      return ctx.reply(
-        `⏳ <b>Active Waiting Job: #${waitingJob.jobCode}</b>\n` +
-          `Status: <code>WAITING FOR APPROVAL</code>\n` +
-          `Please quote code <b>#${waitingJob.jobCode}</b> at the hostel admin desk.`,
-        { parse_mode: "HTML" }
-      );
-    }
-
     const lastJob = await db.query.jobs.findFirst({
-      where: eq(schema.jobs.userId, user.id),
+      where: and(eq(schema.jobs.userId, user.id), sql`${schema.jobs.status} != 'DRAFT'`),
       orderBy: [desc(schema.jobs.createdAt)],
+      with: { files: true },
     });
 
-    if (!lastJob || lastJob.status === "DRAFT") {
+    if (!lastJob) {
       return ctx.reply("No active print jobs. Send a PDF or DOCX file to start printing!");
     }
 
-    return ctx.reply(
-      `📌 <b>Last Job: #${lastJob.jobCode || "Pending"}</b>\n` +
-        `Status: <code>${lastJob.status}</code>`,
-      { parse_mode: "HTML" }
-    );
+    const code = lastJob.jobCode ? `#${lastJob.jobCode}` : "Pending";
+    let statusText = `📌 <b>Print Job ${code}</b>\n` +
+      `Overall Status: <code>${lastJob.status}</code>\n` +
+      `Date: ${lastJob.createdAt.toLocaleDateString()}\n\n` +
+      `📄 <b>Files Breakdown (${lastJob.files.length}):</b>\n`;
+
+    for (let i = 0; i < lastJob.files.length; i++) {
+      const f = lastJob.files[i];
+      const badge = formatFileStatusBadge(f.status || "PENDING");
+      statusText += `${i + 1}. <b>${escapeHtml(f.originalFilename)}</b> — ${badge}\n`;
+      if (f.errorMessage) {
+        statusText += `   <i>Note: ${escapeHtml(f.errorMessage)}</i>\n`;
+      }
+    }
+
+    if (lastJob.status === "WAITING") {
+      statusText += `\n⏳ <i>Waiting for approval. Quote code <b>#${lastJob.jobCode}</b> at the admin desk.</i>`;
+    } else if (lastJob.status === "PRINTING") {
+      statusText += `\n🖨️ <i>Your job is currently being printed by the spooler!</i>`;
+    } else if (lastJob.status === "PRINTED") {
+      statusText += `\n✅ <i>All files in this job have been printed! You can collect your papers.</i>`;
+    }
+
+    return ctx.reply(statusText, { parse_mode: "HTML" });
   });
 
   // 6. /help & /commands
@@ -265,7 +271,12 @@ export function createBot(): Bot<BotContext> {
     for (const job of activeOrSubmitted) {
       const code = job.jobCode ? `#${job.jobCode}` : "Pending";
       const fileCount = job.files.length;
-      text += `• <b>Job ${code}</b> — <code>${job.status}</code>\n  ${fileCount} file(s) · ${job.createdAt.toLocaleDateString()}\n\n`;
+      text += `• <b>Job ${code}</b> — <code>${job.status}</code> (${fileCount} file${fileCount > 1 ? "s" : ""})\n`;
+      for (let i = 0; i < job.files.length; i++) {
+        const f = job.files[i];
+        text += `   ${i + 1}. ${escapeHtml(f.originalFilename)} — ${formatFileStatusBadge(f.status || "PENDING")}\n`;
+      }
+      text += `   <i>${job.createdAt.toLocaleDateString()}</i>\n\n`;
 
       if (job.status === "WAITING") {
         keyboard.text(`❌ Cancel #${job.jobCode}`, `cancel_job_${job.id}`).row();
@@ -844,6 +855,20 @@ export function createBot(): Bot<BotContext> {
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
+  }
+
+  function formatFileStatusBadge(status: string): string {
+    switch (status) {
+      case "PRINTED":
+        return "✅ Printed";
+      case "PRINTING":
+        return "🖨️ Printing...";
+      case "FAILED":
+        return "❌ Failed";
+      case "PENDING":
+      default:
+        return "⏳ Queued";
+    }
   }
 
   return bot;

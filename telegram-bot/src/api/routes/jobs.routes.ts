@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { db, schema } from "../../db/index.js";
-import { eq, inArray, desc, asc } from "drizzle-orm";
+import { eq, inArray, desc, asc, and } from "drizzle-orm";
 import { TelegramFileService } from "../../services/telegram-file.service.js";
 import { PdfService } from "../../services/pdf.service.js";
 
@@ -54,6 +54,9 @@ export async function jobsRoutes(fastify: FastifyInstance, options?: { bot?: any
           inputType: f.inputType,
           pageCount: f.pageCount,
           sizeBytes: f.sizeBytes,
+          status: f.status || "PENDING",
+          errorMessage: f.errorMessage || null,
+          printedAt: f.printedAt || null,
           settings: f.settings
             ? {
                 pageRange: f.settings.pageRange,
@@ -113,6 +116,9 @@ export async function jobsRoutes(fastify: FastifyInstance, options?: { bot?: any
           inputType: f.inputType,
           pageCount: f.pageCount,
           sizeBytes: f.sizeBytes,
+          status: f.status || "PENDING",
+          errorMessage: f.errorMessage || null,
+          printedAt: f.printedAt || null,
           settings: f.settings
             ? {
                 pageRange: f.settings.pageRange,
@@ -207,6 +213,13 @@ export async function jobsRoutes(fastify: FastifyInstance, options?: { bot?: any
         updatedAt: new Date(),
       })
       .where(eq(schema.jobs.id, id));
+
+    if (status === "PRINTED") {
+      await db
+        .update(schema.jobFiles)
+        .set({ status: "PRINTED", printedAt: new Date() })
+        .where(eq(schema.jobFiles.jobId, id));
+    }
 
     // If an attempt was executed, log it safely
     try {
@@ -343,5 +356,34 @@ export async function jobsRoutes(fastify: FastifyInstance, options?: { bot?: any
       request.log.error(error);
       return reply.status(500).send({ error: "Failed to compose images into PDF" });
     }
+  });
+
+  // 8. Update Individual File Status (PDF-level tracking)
+  fastify.patch("/:id/files/:fileId/status", async (request, reply) => {
+    const { id, fileId } = request.params as { id: string; fileId: string };
+    const { status, errorMessage } = request.body as {
+      status: "PENDING" | "PRINTING" | "PRINTED" | "FAILED";
+      errorMessage?: string;
+    };
+
+    const file = await db.query.jobFiles.findFirst({
+      where: and(eq(schema.jobFiles.id, fileId), eq(schema.jobFiles.jobId, id)),
+    });
+
+    if (!file) {
+      return reply.status(404).send({ error: "File not found in job" });
+    }
+
+    const updated = await db
+      .update(schema.jobFiles)
+      .set({
+        status: status || "PENDING",
+        errorMessage: errorMessage || null,
+        printedAt: status === "PRINTED" ? new Date() : undefined,
+      })
+      .where(eq(schema.jobFiles.id, fileId))
+      .returning();
+
+    return { success: true, file: updated[0] };
   });
 }

@@ -117,16 +117,49 @@
 | **Attempt 4** | XPath injection of `psk:Draft` in PrintTicket | `psk:PageOutputQuality` was overwritten by `SetPrinter` running alongside it. |
 | **Final Fix** | **1.** Removed legacy `SetPrinter` completely.<br>**2.** Injected HP's exact proprietary shortcut (`_FastEco`) into `PrintTicketXML`.<br>**3.** Set `psk:PageOutputQuality = psk:Draft`, `ns0000:JobOutputQualityPrev = ns0000:Draft`, `psk:PageResolution = ns0000:_300dpi`, and `Color = False`. | **100% Solved.** Verified live via PowerShell and Win32 `GetDeviceCaps` DC caps. |
 
+### F. Driver Conflict & Override Verification:
+- **Verification Method:** Executed Windows `System.Printing` subsystem `MergeAndValidatePrintTicket` directly against the live `HP Smart Tank 580-590 series PCL-3 (V4)` driver.
+- **Validation Result:** `ConflictStatus = None`.
+- **Conclusion:** The injected print settings cleanly override driver defaults without any conflicting constraints. The driver does NOT revert to the default 600 DPI.
+
 ---
 
-## 5. 🤖 Telegram Bot Features & Menu
+## 5. 📑 Granular PDF-Level Print Tracking Architecture
+
+To handle multi-PDF jobs (e.g. 5 PDFs in one job) with transparent per-file progress and failure resilience:
+
+1. **Database Schema (`job_files`):**
+   - `status`: `'PENDING' | 'PRINTING' | 'PRINTED' | 'FAILED'` (default `'PENDING'`).
+   - `error_message`: Captures printer spooler errors or file corruption messages.
+   - `printed_at`: Timestamp when the specific file successfully cleared the printer spooler.
+
+2. **Backend API (`/api/v1/jobs`):**
+   - `GET /queue` & `GET /history`: Return full per-file status, error message, and printed timestamp.
+   - `POST /:id/status`: When marking a job `PRINTED`, automatically synchronizes all associated `job_files` to `PRINTED`.
+   - `PATCH /:id/files/:fileId/status`: Allows the desktop client to report real-time progress for individual files (`PRINTING` → `PRINTED` / `FAILED`).
+
+3. **Telegram Bot:**
+   - `/status` command outputs a detailed breakdown:
+     - `1. notes.pdf — ✅ Printed`
+     - `2. assignment.pdf — 🖨️ Printing...`
+     - `3. reference.pdf — ⏳ Queued`
+   - `/jobs` command displays file-level badges within recent print jobs.
+
+4. **Desktop Admin App:**
+   - **Visual File Badges:** Each document card in the queue displays real-time status chips (`⏳ QUEUED`, `🖨️ PRINTING...`, `✅ PRINTED`, `❌ FAILED`) with specific error callouts.
+   - **Granular Actions:** Each file can be previewed, edited, downloaded individually, or reprinted individually ("Print This File" / "Reprint File").
+   - **Sequential Spooling Loop:** Updates each file to `PRINTING` before transmission, awaits physical completion via `trackJobCompletion`, updates to `PRINTED`, and smoothly transitions to the next document.
+
+---
+
+## 6. 🤖 Telegram Bot Features & Menu
 
 - **Native Command Menu (`[/]` Button):**
   Registered with Telegram servers via `bot.api.setMyCommands`:
   - `/start` — Start the bot & submit documents
   - `/menu` — Open main interactive navigation menu
   - `/jobs` — View submitted print jobs, job codes, and statuses
-  - `/status` — Check status of the current active job
+  - `/status` — Check status of the current active job with file breakdown
   - `/name` — View or update student display name
   - `/clear` — Clear current draft & reset chat session
   - `/help` — Guidelines, supported formats, and tips
@@ -141,7 +174,7 @@
 
 ---
 
-## 6. 🌐 Hosting & Git Configuration
+## 7. 🌐 Hosting & Git Configuration
 
 - **Backend Hosting:**
   - **Platform:** Render (`https://render.com`)
@@ -157,7 +190,7 @@
 
 ---
 
-## 7. 🔍 Final Verification of Global Print Settings
+## 8. 🔍 Final Verification of Global Print Settings
 
 Hardware and software verification performed live on the active machine:
 

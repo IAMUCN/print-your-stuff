@@ -104,6 +104,35 @@ class ApiService {
     }
   }
 
+  static Future<void> updateFileStatus(
+    String jobId,
+    String fileId,
+    String status, {
+    String? errorMessage,
+  }) async {
+    final baseUrl = await StorageService.getBackendUrl();
+    final url = Uri.parse('$baseUrl/api/v1/jobs/$jobId/files/$fileId/status');
+
+    try {
+      final response = await http.patch(
+        url,
+        headers: await _headers(),
+        body: jsonEncode({
+          'status': status,
+          if (errorMessage != null) 'errorMessage': errorMessage,
+        }),
+      );
+
+      if (response.statusCode != 200) {
+        // ignore: avoid_print
+        print('⚠️ Failed to update file status to $status: HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('⚠️ Error updating file status: $e');
+    }
+  }
+
   static Future<Uint8List> downloadFileBytes(String jobId, String fileId) async {
     final baseUrl = await StorageService.getBackendUrl();
     final url = Uri.parse('$baseUrl/api/v1/jobs/$jobId/files/$fileId/stream');

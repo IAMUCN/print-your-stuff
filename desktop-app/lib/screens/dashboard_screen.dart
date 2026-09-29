@@ -390,6 +390,71 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  void _updateLocalFileStatus(String fileId, String status, {String? errorMessage}) {
+    if (!mounted || _selectedJob == null) return;
+    setState(() {
+      final updatedFiles = _selectedJob!.files.map((f) {
+        if (f.id == fileId) {
+          return f.copyWith(
+            status: status,
+            errorMessage: errorMessage,
+            printedAt: status == 'PRINTED' ? DateTime.now() : f.printedAt,
+          );
+        }
+        return f;
+      }).toList();
+
+      _selectedJob = PrintJob(
+        id: _selectedJob!.id,
+        jobCode: _selectedJob!.jobCode,
+        studentName: _selectedJob!.studentName,
+        status: _selectedJob!.status,
+        createdAt: _selectedJob!.createdAt,
+        updatedAt: _selectedJob!.updatedAt,
+        expiresAt: _selectedJob!.expiresAt,
+        fileCount: _selectedJob!.fileCount,
+        totalSheetsEst: _selectedJob!.totalSheetsEst,
+        files: updatedFiles,
+      );
+
+      _queue = _queue.map((j) {
+        if (j.id == _selectedJob!.id) {
+          return PrintJob(
+            id: j.id,
+            jobCode: j.jobCode,
+            studentName: j.studentName,
+            status: j.status,
+            createdAt: j.createdAt,
+            updatedAt: j.updatedAt,
+            expiresAt: j.expiresAt,
+            fileCount: j.fileCount,
+            totalSheetsEst: j.totalSheetsEst,
+            files: updatedFiles,
+          );
+        }
+        return j;
+      }).toList();
+
+      _history = _history.map((j) {
+        if (j.id == _selectedJob!.id) {
+          return PrintJob(
+            id: j.id,
+            jobCode: j.jobCode,
+            studentName: j.studentName,
+            status: j.status,
+            createdAt: j.createdAt,
+            updatedAt: j.updatedAt,
+            expiresAt: j.expiresAt,
+            fileCount: j.fileCount,
+            totalSheetsEst: j.totalSheetsEst,
+            files: updatedFiles,
+          );
+        }
+        return j;
+      }).toList();
+    });
+  }
+
   Future<void> _printSingleFile(JobFile file, {bool useDialog = false}) async {
     if (_selectedJob == null) return;
     final job = _selectedJob!;
@@ -398,6 +463,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final globalDpi = await StorageService.getGlobalDpi();
 
     try {
+      _updateLocalFileStatus(file.id, 'PRINTING');
+      await ApiService.updateFileStatus(job.id, file.id, 'PRINTING');
+
       if (mounted) {
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
         ScaffoldMessenger.of(context).showSnackBar(
@@ -455,6 +523,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
 
       if (!success) {
+        _updateLocalFileStatus(file.id, 'FAILED', errorMessage: 'Spooler rejected');
+        await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: 'Spooler rejected');
         throw Exception('Windows print spooler rejected or cancelled ${file.filename}');
       }
 
@@ -477,6 +547,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         );
 
         if (spoolerStatus.state == SpoolerState.cancelled) {
+          _updateLocalFileStatus(file.id, 'FAILED', errorMessage: 'Print cancelled at printer');
+          await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: 'Print cancelled at printer');
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -489,8 +561,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
 
         if (spoolerStatus.state == SpoolerState.error || spoolerStatus.state == SpoolerState.jammed) {
-          throw Exception(spoolerStatus.message ?? 'Printer hardware error occurred');
+          final errMsg = spoolerStatus.message ?? 'Printer hardware error occurred';
+          _updateLocalFileStatus(file.id, 'FAILED', errorMessage: errMsg);
+          await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: errMsg);
+          throw Exception(errMsg);
         }
+      }
+
+      _updateLocalFileStatus(file.id, 'PRINTED');
+      await ApiService.updateFileStatus(job.id, file.id, 'PRINTED');
+
+      // Check if all files in the current job are now printed
+      final currentFiles = _selectedJob?.files ?? [];
+      final allPrinted = currentFiles.isNotEmpty && currentFiles.every((f) => f.id == file.id || f.status == 'PRINTED');
+      if (allPrinted) {
+        final targetPrinterName = await StorageService.getPrinterName();
+        await ApiService.updateStatus(job.id, 'PRINTED', printerName: targetPrinterName);
+        await _refreshAll(silent: true);
       }
 
       if (mounted) {
@@ -499,6 +586,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         );
       }
     } catch (e) {
+      _updateLocalFileStatus(file.id, 'FAILED', errorMessage: e.toString());
+      await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: e.toString());
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -748,6 +837,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // Print each file in the job sequentially
       for (int fIdx = 0; fIdx < job.files.length; fIdx++) {
         final file = job.files[fIdx];
+        _updateLocalFileStatus(file.id, 'PRINTING');
+        await ApiService.updateFileStatus(job.id, file.id, 'PRINTING');
 
         // Give the Windows Print Spooler and physical USB port 2.5 seconds to settle between documents
         if (fIdx > 0) {
@@ -765,6 +856,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         Uint8List pdfBytes;
         if (file.inputType == 'IMAGE') {
           if (composedImagePrinted) {
+            _updateLocalFileStatus(file.id, 'PRINTED');
+            await ApiService.updateFileStatus(job.id, file.id, 'PRINTED');
             continue; // Prevent printing composed images multiple times
           }
           composedImagePrinted = true;
@@ -817,6 +910,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
 
         if (!success) {
+          _updateLocalFileStatus(file.id, 'FAILED', errorMessage: 'Spooler rejected');
+          await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: 'Spooler rejected');
           throw Exception('Windows print spooler rejected or cancelled ${file.filename}');
         }
 
@@ -840,6 +935,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
           );
 
           if (spoolerStatus.state == SpoolerState.cancelled) {
+            _updateLocalFileStatus(file.id, 'FAILED', errorMessage: 'Print cancelled at printer');
+            await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: 'Print cancelled at printer');
             await ApiService.updateStatus(job.id, 'CANCELLED', errorMessage: 'Print job cancelled at printer');
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
@@ -855,9 +952,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
           }
 
           if (spoolerStatus.state == SpoolerState.error || spoolerStatus.state == SpoolerState.jammed) {
-            throw Exception(spoolerStatus.message ?? 'Printer hardware error occurred during printing');
+            final errMsg = spoolerStatus.message ?? 'Printer hardware error occurred during printing';
+            _updateLocalFileStatus(file.id, 'FAILED', errorMessage: errMsg);
+            await ApiService.updateFileStatus(job.id, file.id, 'FAILED', errorMessage: errMsg);
+            throw Exception(errMsg);
           }
         }
+
+        _updateLocalFileStatus(file.id, 'PRINTED');
+        await ApiService.updateFileStatus(job.id, file.id, 'PRINTED');
       }
 
       final printerName = await StorageService.getPrinterName();
@@ -1523,8 +1626,33 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ],
                   ),
                 ),
+                const SizedBox(width: 8),
+                _buildFileStatusBadge(file.status),
               ],
             ),
+            if (file.errorMessage != null && file.errorMessage!.trim().isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.redAccent.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.redAccent.withValues(alpha: 0.4)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline, size: 14, color: Colors.redAccent),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        file.errorMessage!,
+                        style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
@@ -1565,9 +1693,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   onPressed: () => _previewFile(file),
                 ),
                 OutlinedButton.icon(
-                  icon: const Icon(Icons.print_outlined, size: 16),
-                  label: const Text('Print This File'),
-                  onPressed: () => _printSingleFile(file),
+                  icon: Icon(
+                    file.status == 'PRINTING' ? Icons.hourglass_top : Icons.print_outlined,
+                    size: 16,
+                  ),
+                  label: Text(
+                    file.status == 'PRINTING'
+                        ? 'Printing...'
+                        : (file.status == 'PRINTED' ? 'Reprint File' : 'Print This File'),
+                  ),
+                  onPressed: file.status == 'PRINTING' ? null : () => _printSingleFile(file),
                 ),
                 if (allowEdit) ...[
                   OutlinedButton.icon(
@@ -1580,6 +1715,60 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildFileStatusBadge(String status) {
+    Color color;
+    IconData icon;
+    String label;
+
+    switch (status.toUpperCase()) {
+      case 'PRINTED':
+        color = Colors.greenAccent;
+        icon = Icons.check_circle_outline;
+        label = 'PRINTED';
+        break;
+      case 'PRINTING':
+        color = Colors.cyanAccent;
+        icon = Icons.print;
+        label = 'PRINTING...';
+        break;
+      case 'FAILED':
+        color = Colors.redAccent;
+        icon = Icons.error_outline;
+        label = 'FAILED';
+        break;
+      case 'PENDING':
+      default:
+        color = Colors.amberAccent;
+        icon = Icons.hourglass_bottom;
+        label = 'QUEUED';
+        break;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withValues(alpha: 0.6)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 5),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              color: color,
+            ),
+          ),
+        ],
       ),
     );
   }

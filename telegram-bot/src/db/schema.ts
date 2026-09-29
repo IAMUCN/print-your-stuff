@@ -73,6 +73,9 @@ export const jobFiles = pgTable("job_files", {
   inputType: inputTypeEnum("input_type").notNull(),
   pageCount: integer("page_count"),
   sortOrder: integer("sort_order").notNull().default(0),
+  status: text("status").notNull().default("PENDING"),
+  errorMessage: text("error_message"),
+  printedAt: timestamp("printed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

@@ -63,6 +63,9 @@ class JobFile {
   final int? pageCount;
   final int sizeBytes;
   final PrintSettings settings;
+  final String status; // 'PENDING' | 'PRINTING' | 'PRINTED' | 'FAILED'
+  final String? errorMessage;
+  final DateTime? printedAt;
 
   JobFile({
     required this.id,
@@ -71,6 +74,9 @@ class JobFile {
     this.pageCount,
     required this.sizeBytes,
     required this.settings,
+    this.status = 'PENDING',
+    this.errorMessage,
+    this.printedAt,
   });
 
   factory JobFile.fromJson(Map<String, dynamic> json) {
@@ -83,6 +89,33 @@ class JobFile {
       settings: json['settings'] != null
           ? PrintSettings.fromJson(json['settings'] as Map<String, dynamic>)
           : PrintSettings(),
+      status: (json['status'] as String?) ?? 'PENDING',
+      errorMessage: json['errorMessage'] as String?,
+      printedAt: json['printedAt'] != null ? DateTime.tryParse(json['printedAt'].toString()) : null,
+    );
+  }
+
+  JobFile copyWith({
+    String? id,
+    String? filename,
+    String? inputType,
+    int? pageCount,
+    int? sizeBytes,
+    PrintSettings? settings,
+    String? status,
+    String? errorMessage,
+    DateTime? printedAt,
+  }) {
+    return JobFile(
+      id: id ?? this.id,
+      filename: filename ?? this.filename,
+      inputType: inputType ?? this.inputType,
+      pageCount: pageCount ?? this.pageCount,
+      sizeBytes: sizeBytes ?? this.sizeBytes,
+      settings: settings ?? this.settings,
+      status: status ?? this.status,
+      errorMessage: errorMessage ?? this.errorMessage,
+      printedAt: printedAt ?? this.printedAt,
     );
   }
 }
