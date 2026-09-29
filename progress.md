@@ -174,7 +174,32 @@ To handle multi-PDF jobs (e.g. 5 PDFs in one job) with transparent per-file prog
 
 ---
 
-## 7. 🌐 Hosting & Git Configuration
+## 7. 🖥️ Desktop Application Window Management & Desktop UX Polish
+
+- **Win32 Viewport & Minimization Freeze Fix:**
+  - **Issue Identified:** In `desktop-app/windows/runner/win32_window.cpp`, minimizing the application (`wparam == SIZE_MINIMIZED`) caused `GetClientArea()` to report `0x0`, and `MoveWindow(child_content_, ...)` collapsed the Flutter child render target to zero dimensions. This caused the DirectX swapchain to freeze, making restore and maximize impossible.
+  - **Resolution:** Guarded `MoveWindow` with `if (wparam != SIZE_MINIMIZED)` so the child view surface remains intact when minimized. Appended `InvalidateRect(child_content_, nullptr, TRUE)` and `UpdateWindow(child_content_)` on restore/activate to instantly force redraw upon restoring.
+- **Window Resizing & Bounds Enforcement:**
+  - Integrated `window_manager` (`^0.5.2`) and `screen_retriever` (`^0.2.2`).
+  - Configured window initialization in `lib/main.dart` with default size `1280x750`, minimum size `960x600` (preventing UI clipping), centered on screen, and explicitly enabling `setResizable(true)`.
+- **Common Desktop Functionalities Implemented:**
+  - **Window Control Actions in AppBar:** Added Minimize button, Maximize/Restore toggle button (`Icons.crop_square` / `Icons.filter_none`), and Fullscreen toggle button (`Icons.fullscreen` / `Icons.fullscreen_exit`).
+  - **Double-Click Title Bar:** Double-clicking the AppBar automatically toggles between maximized and restored window states.
+  - **Taskbar Badge Title:** The application title dynamically updates to reflect workload (`Hostel Print Manager (X Pending Jobs)`).
+  - **Keyboard Accelerators:**
+    - `F11`: Toggle Fullscreen mode
+    - `F5` / `Ctrl + R`: Refresh queue & printer connection status
+    - `Ctrl + F`: Jump to & focus search filter
+    - `Ctrl + D`: Open Driver Diagnostics dialog
+    - `Ctrl + ,`: Open Global Settings dialog
+    - `Escape`: Clear search filter or exit fullscreen
+  - **Desktop Scrollbars:** Added always-visible desktop scrollbars (`Scrollbar(thumbVisibility: true)`) with smooth mouse-wheel support for both the queue list and job inspection view.
+  - **Right-Click Context Menu:** Right-clicking any job card opens a desktop context menu ("Print Job", "Print via Dialog", "Copy Job Code", "Cancel Job").
+  - **Responsive Queue Sidebar:** Uses `LayoutBuilder` to dynamically scale the queue sidebar width (380px on screens $\ge$ 1200px, 320px on medium screens, 280px on compact screens).
+
+---
+
+## 8. 🌐 Hosting & Git Configuration
 
 - **Backend Hosting:**
   - **Platform:** Render (`https://render.com`)
@@ -190,7 +215,7 @@ To handle multi-PDF jobs (e.g. 5 PDFs in one job) with transparent per-file prog
 
 ---
 
-## 8. 🔍 Final Verification of Global Print Settings
+## 9. 🔍 Final Verification of Global Print Settings
 
 Hardware and software verification performed live on the active machine:
 

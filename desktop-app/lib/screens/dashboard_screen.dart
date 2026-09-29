@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../models/job.dart';
 import '../services/api_service.dart';
@@ -33,7 +34,7 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen> with WindowListener {
   DashboardTab _currentTab = DashboardTab.activeQueue;
   List<PrintJob> _queue = [];
   List<PrintJob> _history = [];
@@ -44,15 +45,138 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Timer? _pollingTimer;
   bool _isPrinting = false;
 
+  bool _isMaximized = false;
+  bool _isFullScreen = false;
+  final FocusNode _searchFocusNode = FocusNode();
+  final TextEditingController _searchController = TextEditingController();
+  final ScrollController _queueScrollController = ScrollController();
+  final ScrollController _detailScrollController = ScrollController();
+
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
+    _initWindowState();
     _initialLoad();
     _startPolling();
   }
 
+  Future<void> _initWindowState() async {
+    try {
+      final isMax = await windowManager.isMaximized();
+      final isFull = await windowManager.isFullScreen();
+      if (mounted) {
+        setState(() {
+          _isMaximized = isMax;
+          _isFullScreen = isFull;
+        });
+      }
+    } catch (_) {}
+  }
+
+  @override
+  void onWindowMaximize() {
+    if (mounted) setState(() => _isMaximized = true);
+  }
+
+  @override
+  void onWindowUnmaximize() {
+    if (mounted) setState(() => _isMaximized = false);
+  }
+
+  @override
+  void onWindowRestore() {
+    _initWindowState();
+  }
+
+  Future<void> _toggleMaximize() async {
+    try {
+      if (await windowManager.isMaximized()) {
+        await windowManager.unmaximize();
+      } else {
+        await windowManager.maximize();
+      }
+    } catch (e) {
+      debugPrint('Error toggling maximize: $e');
+    }
+  }
+
+  Future<void> _toggleFullScreen() async {
+    try {
+      final isFull = await windowManager.isFullScreen();
+      await windowManager.setFullScreen(!isFull);
+      if (mounted) {
+        setState(() => _isFullScreen = !isFull);
+      }
+    } catch (e) {
+      debugPrint('Error toggling fullscreen: $e');
+    }
+  }
+
+  Future<void> _minimizeWindow() async {
+    try {
+      await windowManager.minimize();
+    } catch (e) {
+      debugPrint('Error minimizing: $e');
+    }
+  }
+
+  void _handleKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return;
+
+    final isControlPressed = HardwareKeyboard.instance.isControlPressed;
+
+    // F11: Toggle Fullscreen
+    if (event.logicalKey == LogicalKeyboardKey.f11) {
+      _toggleFullScreen();
+      return;
+    }
+
+    // F5 or Ctrl + R: Refresh
+    if (event.logicalKey == LogicalKeyboardKey.f5 ||
+        (isControlPressed && event.logicalKey == LogicalKeyboardKey.keyR)) {
+      _initialLoad();
+      return;
+    }
+
+    // Ctrl + F: Focus search
+    if (isControlPressed && event.logicalKey == LogicalKeyboardKey.keyF) {
+      _searchFocusNode.requestFocus();
+      return;
+    }
+
+    // Ctrl + D: Driver Diagnostics
+    if (isControlPressed && event.logicalKey == LogicalKeyboardKey.keyD) {
+      DriverDiagnosticsDialog.show(context);
+      return;
+    }
+
+    // Ctrl + , : Settings Dialog
+    if (isControlPressed && event.logicalKey == LogicalKeyboardKey.comma) {
+      SettingsDialog.show(context);
+      return;
+    }
+
+    // Escape: clear search or unfocus
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      if (_searchFocusNode.hasFocus) {
+        _searchController.clear();
+        setState(() => _searchQuery = '');
+        _searchFocusNode.unfocus();
+      } else if (_isFullScreen) {
+        _toggleFullScreen();
+      }
+      return;
+    }
+  }
+
   @override
   void dispose() {
+    windowManager.removeListener(this);
+    _searchFocusNode.dispose();
+    _searchController.dispose();
+    _queueScrollController.dispose();
+    _detailScrollController.dispose();
     _pollingTimer?.cancel();
     super.dispose();
   }
@@ -103,6 +227,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             }
           }
         });
+        final title = _queue.isNotEmpty
+            ? 'Hostel Print Manager (${_queue.length} Pending Job${_queue.length > 1 ? "s" : ""})'
+            : 'Hostel Print Manager';
+        windowManager.setTitle(title);
       }
     } catch (e) {
       if (mounted) {
@@ -1066,261 +1194,315 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: AppTheme.background,
-      appBar: AppBar(
-        title: Row(
-          children: [
-            const Icon(Icons.print_rounded, size: 22),
-            const SizedBox(width: 10),
-            const Text(
-              'HOSTEL PRINT MANAGER',
-              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1),
-            ),
-            const SizedBox(width: 30),
-            SizedBox(
-              width: 260,
-              height: 38,
-              child: TextField(
-                decoration: const InputDecoration(
-                  hintText: 'Search #Code or Name...',
-                  prefixIcon: Icon(Icons.search, size: 18),
-                  contentPadding: EdgeInsets.zero,
-                ),
-                onChanged: (val) => setState(() => _searchQuery = val),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () => _initialLoad(),
-            tooltip: 'Refresh Queue & Printer',
-          ),
-          const SizedBox(width: 8),
-          PrinterStatusChip(
-            status: _printerStatus,
-            isPrinting: _isPrinting,
-            currentJobCode: _selectedJob?.jobCode,
-            onRefresh: _checkPrinter,
-          ),
-          const SizedBox(width: 8),
-          InkWell(
-            onTap: () => DriverDiagnosticsDialog.show(context),
-            borderRadius: BorderRadius.circular(20),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: AppTheme.accent.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: AppTheme.accent.withValues(alpha: 0.4)),
-              ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.tune, size: 14, color: AppTheme.accent),
-                  SizedBox(width: 6),
-                  Text(
-                    '300 DPI · DRAFT',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      color: AppTheme.accent,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            icon: const Icon(Icons.settings_outlined),
-            onPressed: () => SettingsDialog.show(context),
-            tooltip: 'Settings',
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: _logout,
-            tooltip: 'Logout',
-          ),
-          const SizedBox(width: 12),
-        ],
-      ),
-      body: Column(
-        children: [
-          const ConversionBanner(),
-          Expanded(
+    return KeyboardListener(
+      focusNode: FocusNode()..requestFocus(),
+      autofocus: true,
+      onKeyEvent: _handleKeyEvent,
+      child: Scaffold(
+        backgroundColor: AppTheme.background,
+        appBar: AppBar(
+          title: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onDoubleTap: _toggleMaximize,
             child: Row(
               children: [
-                // Left Panel: Queue & Completed Tabs (38% width)
-                SizedBox(
-                  width: 380,
-                  child: Container(
-                    decoration: const BoxDecoration(
-                      border: Border(right: BorderSide(color: AppTheme.border)),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        // Tab Selector
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
-                          child: Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: BoxDecoration(
-                              color: AppTheme.surfaceElevated,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: AppTheme.border),
-                            ),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: InkWell(
-                                    onTap: () {
-                                      setState(() {
-                                        _currentTab = DashboardTab.activeQueue;
-                                        _selectedJob = _filteredQueue.isNotEmpty
-                                            ? _filteredQueue.first
-                                            : null;
-                                      });
-                                    },
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(vertical: 8),
-                                      decoration: BoxDecoration(
-                                        color: _currentTab == DashboardTab.activeQueue
-                                            ? Colors.white
-                                            : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      alignment: Alignment.center,
-                                      child: Row(
-                                        mainAxisAlignment: MainAxisAlignment.center,
-                                        children: [
-                                          Icon(
-                                            Icons.queue_play_next,
-                                            size: 14,
-                                            color: _currentTab == DashboardTab.activeQueue
-                                                ? Colors.black
-                                                : AppTheme.textSecondary,
-                                          ),
-                                          const SizedBox(width: 6),
-                                          Text(
-                                            'Active Queue (${_queue.length})',
-                                            style: TextStyle(
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.bold,
-                                              color: _currentTab == DashboardTab.activeQueue
-                                                  ? Colors.black
-                                                  : AppTheme.textSecondary,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 4),
-                                Expanded(
-                                  child: InkWell(
-                                    onTap: () {
-                                      setState(() {
-                                        _currentTab = DashboardTab.completedJobs;
-                                        _selectedJob = _filteredHistory.isNotEmpty
-                                            ? _filteredHistory.first
-                                            : null;
-                                      });
-                                    },
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(vertical: 8),
-                                      decoration: BoxDecoration(
-                                        color: _currentTab == DashboardTab.completedJobs
-                                            ? Colors.white
-                                            : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      alignment: Alignment.center,
-                                      child: Row(
-                                        mainAxisAlignment: MainAxisAlignment.center,
-                                        children: [
-                                          Icon(
-                                            Icons.history,
-                                            size: 14,
-                                            color: _currentTab == DashboardTab.completedJobs
-                                                ? Colors.black
-                                                : AppTheme.textSecondary,
-                                          ),
-                                          const SizedBox(width: 6),
-                                          Text(
-                                            'Completed (${_history.length})',
-                                            style: TextStyle(
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.bold,
-                                              color: _currentTab == DashboardTab.completedJobs
-                                                  ? Colors.black
-                                                  : AppTheme.textSecondary,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        if (_loading)
-                          const Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                            child: LinearProgressIndicator(
-                              minHeight: 2,
-                              backgroundColor: Colors.transparent,
-                              color: Colors.white,
-                            ),
-                          ),
-                        const Divider(height: 1),
-                        Expanded(
-                          child: _currentList.isEmpty
-                              ? Center(
-                                  child: Text(
-                                    _searchQuery.isEmpty
-                                        ? (_currentTab == DashboardTab.activeQueue
-                                            ? 'No print jobs waiting'
-                                            : 'No completed jobs recorded')
-                                        : 'No jobs match search',
-                                    style: const TextStyle(color: AppTheme.textSecondary),
-                                  ),
-                                )
-                              : ListView.builder(
-                                  itemCount: _currentList.length,
-                                  itemBuilder: (ctx, i) {
-                                    final job = _currentList[i];
-                                    final isSelected = _selectedJob?.id == job.id;
-                                    return _buildQueueTile(job, isSelected);
-                                  },
-                                ),
-                        ),
-                      ],
-                    ),
-                  ),
+                const Icon(Icons.print_rounded, size: 22),
+                const SizedBox(width: 10),
+                const Text(
+                  'HOSTEL PRINT MANAGER',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1),
                 ),
-
-                // Right Panel: Job Detail (62% width)
-                Expanded(
-                  child: _selectedJob == null
-                      ? const Center(
-                          child: Text('Select a job from the queue to inspect', style: TextStyle(color: AppTheme.textSecondary)),
-                        )
-                      : _buildJobDetailPanel(_selectedJob!),
+                const SizedBox(width: 24),
+                SizedBox(
+                  width: 270,
+                  height: 38,
+                  child: TextField(
+                    controller: _searchController,
+                    focusNode: _searchFocusNode,
+                    decoration: InputDecoration(
+                      hintText: 'Search #Code or Name (Ctrl+F)...',
+                      prefixIcon: const Icon(Icons.search, size: 18),
+                      suffixIcon: _searchQuery.isNotEmpty
+                          ? IconButton(
+                              icon: const Icon(Icons.clear, size: 16),
+                              onPressed: () {
+                                _searchController.clear();
+                                setState(() => _searchQuery = '');
+                              },
+                            )
+                          : null,
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                    onChanged: (val) => setState(() => _searchQuery = val),
+                  ),
                 ),
               ],
             ),
           ),
-        ],
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: () => _initialLoad(),
+              tooltip: 'Refresh Queue & Printer (Ctrl+R / F5)',
+            ),
+            const SizedBox(width: 6),
+            PrinterStatusChip(
+              status: _printerStatus,
+              isPrinting: _isPrinting,
+              currentJobCode: _selectedJob?.jobCode,
+              onRefresh: _checkPrinter,
+            ),
+            const SizedBox(width: 6),
+            InkWell(
+              onTap: () => DriverDiagnosticsDialog.show(context),
+              borderRadius: BorderRadius.circular(20),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: AppTheme.accent.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: AppTheme.accent.withValues(alpha: 0.4)),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.tune, size: 14, color: AppTheme.accent),
+                    SizedBox(width: 6),
+                    Text(
+                      '300 DPI · DRAFT',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.accent,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            IconButton(
+              icon: const Icon(Icons.settings_outlined),
+              onPressed: () => SettingsDialog.show(context),
+              tooltip: 'Settings (Ctrl+,)',
+            ),
+            IconButton(
+              icon: const Icon(Icons.logout),
+              onPressed: _logout,
+              tooltip: 'Logout',
+            ),
+            Container(
+              height: 24,
+              width: 1,
+              color: AppTheme.border,
+              margin: const EdgeInsets.symmetric(horizontal: 4),
+            ),
+            IconButton(
+              icon: const Icon(Icons.remove, size: 18),
+              onPressed: _minimizeWindow,
+              tooltip: 'Minimize Window',
+            ),
+            IconButton(
+              icon: Icon(_isMaximized ? Icons.filter_none : Icons.crop_square, size: 16),
+              onPressed: _toggleMaximize,
+              tooltip: _isMaximized ? 'Restore Window' : 'Maximize Window',
+            ),
+            IconButton(
+              icon: Icon(_isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen, size: 20),
+              onPressed: _toggleFullScreen,
+              tooltip: _isFullScreen ? 'Exit Fullscreen (F11)' : 'Fullscreen (F11)',
+            ),
+            const SizedBox(width: 8),
+          ],
+        ),
+        body: Column(
+          children: [
+            const ConversionBanner(),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (ctx, constraints) {
+                  final isWide = constraints.maxWidth >= 1200;
+                  final queueWidth = isWide ? 380.0 : (constraints.maxWidth >= 960 ? 320.0 : 280.0);
+
+                  return Row(
+                    children: [
+                      // Left Panel: Queue & Completed Tabs
+                      SizedBox(
+                        width: queueWidth,
+                        child: Container(
+                          decoration: const BoxDecoration(
+                            border: Border(right: BorderSide(color: AppTheme.border)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // Tab Selector
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+                                child: Container(
+                                  padding: const EdgeInsets.all(4),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.surfaceElevated,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: AppTheme.border),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: InkWell(
+                                          onTap: () {
+                                            setState(() {
+                                              _currentTab = DashboardTab.activeQueue;
+                                              _selectedJob = _filteredQueue.isNotEmpty
+                                                  ? _filteredQueue.first
+                                                  : null;
+                                            });
+                                          },
+                                          borderRadius: BorderRadius.circular(6),
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(vertical: 8),
+                                            decoration: BoxDecoration(
+                                              color: _currentTab == DashboardTab.activeQueue
+                                                  ? Colors.white
+                                                  : Colors.transparent,
+                                              borderRadius: BorderRadius.circular(6),
+                                            ),
+                                            alignment: Alignment.center,
+                                            child: Row(
+                                              mainAxisAlignment: MainAxisAlignment.center,
+                                              children: [
+                                                Icon(
+                                                  Icons.queue_play_next,
+                                                  size: 14,
+                                                  color: _currentTab == DashboardTab.activeQueue
+                                                  ? Colors.black
+                                                  : AppTheme.textSecondary,
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Text(
+                                                  'Active (${_queue.length})',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.bold,
+                                                    color: _currentTab == DashboardTab.activeQueue
+                                                        ? Colors.black
+                                                        : AppTheme.textSecondary,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 4),
+                                      Expanded(
+                                        child: InkWell(
+                                          onTap: () {
+                                            setState(() {
+                                              _currentTab = DashboardTab.completedJobs;
+                                              _selectedJob = _filteredHistory.isNotEmpty
+                                                  ? _filteredHistory.first
+                                                  : null;
+                                            });
+                                          },
+                                          borderRadius: BorderRadius.circular(6),
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(vertical: 8),
+                                            decoration: BoxDecoration(
+                                              color: _currentTab == DashboardTab.completedJobs
+                                                  ? Colors.white
+                                                  : Colors.transparent,
+                                              borderRadius: BorderRadius.circular(6),
+                                            ),
+                                            alignment: Alignment.center,
+                                            child: Row(
+                                              mainAxisAlignment: MainAxisAlignment.center,
+                                              children: [
+                                                Icon(
+                                                  Icons.history,
+                                                  size: 14,
+                                                  color: _currentTab == DashboardTab.completedJobs
+                                                      ? Colors.black
+                                                      : AppTheme.textSecondary,
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Text(
+                                                  'Done (${_history.length})',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.bold,
+                                                    color: _currentTab == DashboardTab.completedJobs
+                                                        ? Colors.black
+                                                        : AppTheme.textSecondary,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              if (_loading)
+                                const Padding(
+                                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                                  child: LinearProgressIndicator(
+                                    minHeight: 2,
+                                    backgroundColor: Colors.transparent,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              const Divider(height: 1),
+                              Expanded(
+                                child: _currentList.isEmpty
+                                    ? Center(
+                                        child: Text(
+                                          _searchQuery.isEmpty
+                                              ? (_currentTab == DashboardTab.activeQueue
+                                                  ? 'No print jobs waiting'
+                                                  : 'No completed jobs recorded')
+                                              : 'No jobs match search',
+                                          style: const TextStyle(color: AppTheme.textSecondary),
+                                        ),
+                                      )
+                                    : Scrollbar(
+                                        controller: _queueScrollController,
+                                        thumbVisibility: true,
+                                        interactive: true,
+                                        child: ListView.builder(
+                                          controller: _queueScrollController,
+                                          itemCount: _currentList.length,
+                                          itemBuilder: (ctx, i) {
+                                            final job = _currentList[i];
+                                            final isSelected = _selectedJob?.id == job.id;
+                                            return _buildQueueTile(job, isSelected);
+                                          },
+                                        ),
+                                      ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+
+                      // Right Panel: Job Detail
+                      Expanded(
+                        child: _selectedJob == null
+                            ? const Center(
+                                child: Text('Select a job from the queue to inspect', style: TextStyle(color: AppTheme.textSecondary)),
+                              )
+                            : _buildJobDetailPanel(_selectedJob!),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1340,77 +1522,160 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  void _showJobContextMenu(Offset position, PrintJob job) async {
+    setState(() => _selectedJob = job);
+
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx + 1,
+        position.dy + 1,
+      ),
+      items: [
+        const PopupMenuItem(
+          value: 'print',
+          child: Row(
+            children: [
+              Icon(Icons.print, size: 18),
+              SizedBox(width: 8),
+              Text('Print Job'),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'print_dialog',
+          child: Row(
+            children: [
+              Icon(Icons.print_outlined, size: 18),
+              SizedBox(width: 8),
+              Text('Print via Dialog...'),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
+          value: 'copy_code',
+          child: Row(
+            children: [
+              Icon(Icons.copy, size: 18),
+              SizedBox(width: 8),
+              Text('Copy Job Code'),
+            ],
+          ),
+        ),
+        if (job.status == 'WAITING' || job.status == 'PRINTING') ...[
+          const PopupMenuDivider(),
+          const PopupMenuItem(
+            value: 'cancel',
+            child: Row(
+              children: [
+                Icon(Icons.cancel_outlined, size: 18, color: Colors.redAccent),
+                SizedBox(width: 8),
+                Text('Cancel Job', style: TextStyle(color: Colors.redAccent)),
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+
+    if (!mounted || selected == null) return;
+
+    if (selected == 'print') {
+      _printJob(useDialog: false);
+    } else if (selected == 'print_dialog') {
+      _printJob(useDialog: true);
+    } else if (selected == 'copy_code') {
+      if (job.jobCode != null) {
+        Clipboard.setData(ClipboardData(text: '#${job.jobCode}'));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('📋 Copied Job Code #${job.jobCode} to clipboard'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } else if (selected == 'cancel') {
+      _cancelJob();
+    }
+  }
+
   Widget _buildQueueTile(PrintJob job, bool isSelected) {
     final statusColor = _getStatusColor(job.status);
 
-    return InkWell(
-      onTap: () => setState(() => _selectedJob = job),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        decoration: BoxDecoration(
-          color: isSelected ? AppTheme.surfaceElevated : Colors.transparent,
-          border: Border(
-            left: BorderSide(
-              color: isSelected ? Colors.white : Colors.transparent,
-              width: 3,
+    return GestureDetector(
+      onSecondaryTapUp: (details) => _showJobContextMenu(details.globalPosition, job),
+      child: InkWell(
+        onTap: () => setState(() => _selectedJob = job),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            color: isSelected ? AppTheme.surfaceElevated : Colors.transparent,
+            border: Border(
+              left: BorderSide(
+                color: isSelected ? Colors.white : Colors.transparent,
+                width: 3,
+              ),
+              bottom: const BorderSide(color: AppTheme.border, width: 0.5),
             ),
-            bottom: const BorderSide(color: AppTheme.border, width: 0.5),
           ),
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: Text(
-                '#${job.jobCode ?? '---'}',
-                style: const TextStyle(
-                  color: Colors.black,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 13,
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(4),
                 ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    job.studentName,
-                    style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                    overflow: TextOverflow.ellipsis,
+                child: Text(
+                  '#${job.jobCode ?? '---'}',
+                  style: const TextStyle(
+                    color: Colors.black,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    '${job.fileCount} file(s) · Est. ${job.totalSheetsEst} sheets',
-                    style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      job.studentName,
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${job.fileCount} file(s) · Est. ${job.totalSheetsEst} sheets',
+                      style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: statusColor.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(
+                    color: statusColor.withValues(alpha: 0.6),
                   ),
-                ],
-              ),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: statusColor.withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(
-                  color: statusColor.withValues(alpha: 0.6),
+                ),
+                child: Text(
+                  job.status,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: statusColor,
+                  ),
                 ),
               ),
-              child: Text(
-                job.status,
-                style: TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                  color: statusColor,
-                ),
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1506,14 +1771,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
         // Files List
         Expanded(
-          child: ListView.separated(
-            padding: const EdgeInsets.all(24),
-            itemCount: job.files.length,
-            separatorBuilder: (_, __) => const SizedBox(height: 16),
-            itemBuilder: (ctx, i) {
-              final file = job.files[i];
-              return _buildFileCard(file, allowEdit: !isCompletedTab);
-            },
+          child: Scrollbar(
+            controller: _detailScrollController,
+            thumbVisibility: true,
+            interactive: true,
+            child: ListView.separated(
+              controller: _detailScrollController,
+              padding: const EdgeInsets.all(24),
+              itemCount: job.files.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 16),
+              itemBuilder: (ctx, i) {
+                final file = job.files[i];
+                return _buildFileCard(file, allowEdit: !isCompletedTab);
+              },
+            ),
           ),
         ),
 
